@@ -100,8 +100,12 @@ async def test_page_served_without_auth(hass, setup, hass_client_no_auth):
     client = await hass_client_no_auth()
     r = await client.get("/tgapp")
     assert r.status == 200
-    assert "frame-ancestors" in r.headers["Content-Security-Policy"]
-    assert "telegram-web-app.js" in await r.text()
+    csp = r.headers["Content-Security-Policy"]
+    assert "frame-ancestors" in csp
+    assert "default-src 'none'" in csp and "connect-src 'self'" in csp
+    html = await r.text()
+    assert "telegram-web-app.js" in html
+    assert "Мережі немає" in html and "confirmTurnOn" in html
 
 
 async def test_menu_button_set(hass, setup, aioclient_mock):
@@ -233,3 +237,47 @@ async def test_layout_name_not_treated_as_entity(hass, setup, hass_client_no_aut
     body = await r.json()
     assert set(body["states"]) == {
         "sensor.deye_battery_soc", "sensor.deye_pv_power", ZONE, HP, AC}
+
+
+async def test_forged_malformed_hash_is_401_not_500(hass, setup, hass_client_no_auth):
+    client = await hass_client_no_auth()
+    bad = init_data().rsplit("hash=", 1)[0] + "hash=" + "%D1%84" * 32
+    r = await client.get("/api/tgapp/state", headers={"X-Telegram-Init-Data": bad})
+    assert r.status == 401
+
+
+async def test_service_error_not_leaked(hass, setup, hass_client_no_auth):
+    from homeassistant.exceptions import HomeAssistantError
+
+    async def boom(call):
+        raise HomeAssistantError("internal detail 192.168.0.10")
+
+    hass.services.async_register("switch", "turn_on", boom)
+    client = await hass_client_no_auth()
+    r = await client.post(
+        "/api/tgapp/action", headers={"X-Telegram-Init-Data": init_data()},
+        json={"action": "switch_on", "entity_id": HP},
+    )
+    assert r.status == 502
+    assert "192.168" not in await r.text()
+
+
+async def test_layout_power_defaults_sent(hass, setup, hass_client_no_auth):
+    client = await hass_client_no_auth()
+    r = await client.get("/api/tgapp/state", headers={"X-Telegram-Init-Data": init_data()})
+    layout = (await r.json())["layout"]
+    assert layout["heating"]["heatpump"]["power_w"] == 2000
+    assert layout["ac"][0]["power_w"] == 1000
+
+
+def test_layout_power_validation():
+    from custom_components.tg_miniapp.const import LayoutError, parse_layout
+
+    ok = parse_layout({"heating": {"heatpump": {"switch": HP, "power_w": 3500}},
+                       "ac": [{"climate": AC, "power_w": 800}]})
+    assert ok["heating"]["heatpump"]["power_w"] == 3500 and ok["ac"][0]["power_w"] == 800
+    for bad in ("2kW", -1, 50000, True):
+        with pytest.raises(LayoutError):
+            parse_layout({"ac": [{"climate": AC, "power_w": bad}]})
+    with pytest.raises(LayoutError):
+        parse_layout({"heating": {"heatpump": "switch.x"}})

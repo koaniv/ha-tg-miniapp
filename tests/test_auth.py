@@ -63,3 +63,14 @@ def test_empty_and_no_hash():
             auth.validate_init_data(s, TOKEN); assert False
         except auth.InitDataError:
             pass
+
+
+def test_malformed_hash_is_rejected_not_crashing():
+    # A non-ASCII hash used to raise TypeError inside hmac.compare_digest (HTTP 500).
+    good = make()
+    for bad in ("%D1%84" * 32, "ZZ", "A" * 64, "0" * 63):
+        s = good.rsplit("hash=", 1)[0] + "hash=" + bad
+        try:
+            auth.validate_init_data(s, TOKEN); assert False
+        except auth.InitDataError as e:
+            assert str(e) == "bad hash"
