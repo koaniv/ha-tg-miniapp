@@ -1,0 +1,91 @@
+"""Telegram Mini App for Home Assistant.
+
+Serves a small web app at /tgapp that opens from the Telegram bot's menu
+button. Every API call is authenticated with the Telegram initData signature
+(bot token from the telegram_bot integration) and the user must be one of the
+bot's allowed private chats.
+"""
+
+from __future__ import annotations
+
+import logging
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import CONF_API_KEY
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
+
+from .const import (
+    CONF_LAYOUT,
+    CONF_MENU_TEXT,
+    CONF_PUBLIC_URL,
+    DEFAULT_MENU_TEXT,
+    DOMAIN,
+    PAGE_URL,
+    TELEGRAM_DOMAIN,
+    LayoutError,
+    parse_layout,
+)
+from .views import ActionView, PageView, StateView
+
+_LOGGER = logging.getLogger(__name__)
+
+
+async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Register the views and point the bot's menu button at the Mini App."""
+    data = hass.data.setdefault(DOMAIN, {})
+    try:
+        data["layout"] = parse_layout(entry.options.get(CONF_LAYOUT))
+    except LayoutError as err:
+        _LOGGER.error("Mini App: layout ignored (%s), using the example layout", err)
+        data["layout"] = parse_layout(None)
+    if not data.get("views_registered"):
+        hass.http.register_view(PageView())
+        hass.http.register_view(StateView())
+        hass.http.register_view(ActionView())
+        data["views_registered"] = True  # aiohttp routes cannot be removed
+
+    entry.async_on_unload(entry.add_update_listener(_async_reload))
+    hass.async_create_task(_async_set_menu_button(hass, entry))
+    return True
+
+
+async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
+    """Nothing to tear down; the routes stay until restart."""
+    return True
+
+
+async def _async_reload(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def _async_set_menu_button(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Set the default menu button of every telegram_bot to open the Mini App."""
+    base = str(entry.options.get(CONF_PUBLIC_URL, entry.data.get(CONF_PUBLIC_URL, "")))
+    text = str(
+        entry.options.get(CONF_MENU_TEXT, entry.data.get(CONF_MENU_TEXT, DEFAULT_MENU_TEXT))
+    )
+    if not base.startswith("https://"):
+        _LOGGER.warning("Mini App: public URL must be https, menu button not set")
+        return
+    url = base.rstrip("/") + PAGE_URL
+    session = async_get_clientsession(hass)
+    for tg_entry in hass.config_entries.async_entries(TELEGRAM_DOMAIN):
+        token = tg_entry.data.get(CONF_API_KEY)
+        if not token:
+            continue
+        payload = {"menu_button": {"type": "web_app", "text": text, "web_app": {"url": url}}}
+        try:
+            async with session.post(
+                f"https://api.telegram.org/bot{token}/setChatMenuButton",
+                json=payload,
+                timeout=15,
+            ) as resp:
+                body = await resp.json(content_type=None)
+        except Exception as err:  # noqa: BLE001 - network errors must not break setup
+            _LOGGER.warning("Mini App: could not set menu button: %s", type(err).__name__)
+            continue
+        if body.get("ok"):
+            _LOGGER.info("Mini App: menu button '%s' -> %s", text, url)
+        else:
+            _LOGGER.warning("Mini App: Telegram refused menu button: %s", body.get("description"))
