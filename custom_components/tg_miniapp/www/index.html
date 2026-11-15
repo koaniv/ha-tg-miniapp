@@ -1,0 +1,392 @@
+<!doctype html>
+<html lang="uk">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Дім</title>
+<script src="https://telegram.org/js/telegram-web-app.js"></script>
+<style>
+:root{
+  --bg:var(--tg-theme-secondary-bg-color,#f1f2f6);
+  --card:var(--tg-theme-section-bg-color,var(--tg-theme-bg-color,#fff));
+  --text:var(--tg-theme-text-color,#111);
+  --hint:var(--tg-theme-hint-color,#8a8f98);
+  --link:var(--tg-theme-link-color,#2481cc);
+  --btn:var(--tg-theme-button-color,#2481cc);
+  --btn-text:var(--tg-theme-button-text-color,#fff);
+  --sep:color-mix(in srgb,var(--hint) 22%,transparent);
+  --soft:color-mix(in srgb,var(--hint) 12%,transparent);
+  --ok:#2fa84f; --warn:#e6a100; --bad:#e5484d; --heat:#f06a2a; --cool:#2f8fe6;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;background:var(--bg);color:var(--text);
+  font:15px/1.35 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+body{padding:0 12px calc(16px + env(safe-area-inset-bottom))}
+.tabs{position:sticky;top:0;z-index:5;display:flex;gap:4px;padding:10px 0 8px;background:var(--bg)}
+.tab{flex:1;border:0;border-radius:10px;padding:9px 4px;font:inherit;font-weight:600;
+  background:var(--card);color:var(--hint);cursor:pointer}
+.tab.on{background:var(--btn);color:var(--btn-text)}
+.card{background:var(--card);border-radius:14px;padding:14px;margin:0 0 10px}
+.row{display:flex;align-items:center;gap:10px}
+.between{justify-content:space-between}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:6px}
+.muted{color:var(--hint)}
+.small{font-size:13px}
+.big{font-size:34px;font-weight:700;line-height:1.1;font-variant-numeric:tabular-nums}
+.mid{font-size:20px;font-weight:650;font-variant-numeric:tabular-nums}
+.title{font-weight:650;font-size:16px}
+.stat{background:var(--soft);border-radius:10px;padding:8px 10px}
+.stat b{display:block;font-size:17px;font-variant-numeric:tabular-nums}
+.stat span{font-size:12px;color:var(--hint)}
+.pill{display:inline-block;padding:3px 9px;border-radius:99px;font-size:13px;font-weight:600}
+.p-ok{background:color-mix(in srgb,var(--ok) 18%,transparent);color:var(--ok)}
+.p-bad{background:color-mix(in srgb,var(--bad) 18%,transparent);color:var(--bad)}
+.p-warn{background:color-mix(in srgb,var(--warn) 20%,transparent);color:var(--warn)}
+.p-heat{background:color-mix(in srgb,var(--heat) 18%,transparent);color:var(--heat)}
+.p-cool{background:color-mix(in srgb,var(--cool) 18%,transparent);color:var(--cool)}
+.p-off{background:var(--soft);color:var(--hint)}
+.bar{height:8px;border-radius:99px;background:var(--soft);overflow:hidden}
+.bar i{display:block;height:100%;border-radius:99px;background:var(--ok);transition:width .4s}
+.phase{display:grid;grid-template-columns:28px 1fr 64px;gap:8px;align-items:center;margin-top:6px}
+.btn{border:0;border-radius:10px;padding:9px 12px;font:inherit;font-weight:650;cursor:pointer;
+  background:var(--soft);color:var(--text);min-width:44px}
+.btn:active{opacity:.6}
+.btn.primary{background:var(--btn);color:var(--btn-text)}
+.btn[disabled]{opacity:.35}
+.seg{display:flex;gap:4px;flex-wrap:wrap;margin-top:10px}
+.seg .btn{flex:1;padding:8px 6px;font-size:14px}
+.seg .btn.on{background:var(--btn);color:var(--btn-text)}
+.temp-ctl{display:flex;align-items:center;gap:8px}
+.temp-ctl .val{min-width:62px;text-align:center;font-size:20px;font-weight:700;font-variant-numeric:tabular-nums}
+.pending{opacity:.55}
+select{font:inherit;border:0;border-radius:10px;padding:8px;background:var(--soft);color:var(--text)}
+.msg{text-align:center;padding:40px 16px;color:var(--hint)}
+.foot{text-align:center;font-size:12px;color:var(--hint);margin-top:6px}
+.hidden{display:none}
+</style>
+</head>
+<body>
+<nav class="tabs" id="tabs">
+  <button class="tab on" data-tab="energy">⚡ Енергія</button>
+  <button class="tab" data-tab="heating">🔥 Опалення</button>
+  <button class="tab" data-tab="ac">❄️ Кондиц.</button>
+</nav>
+<main id="app"><div class="msg">Завантаження…</div></main>
+<div class="foot" id="foot"></div>
+
+<script>
+"use strict";
+const tg = window.Telegram && window.Telegram.WebApp;
+const INIT = tg ? tg.initData : "";
+const POLL_MS = 5000;
+let S = null;            // last /state payload
+let tab = "energy";
+let busy = {};           // entity_id -> true while an action is in flight
+let pendingTemp = {};    // entity_id -> {value, timer}
+let lastOk = 0;
+
+try { const t = localStorage.getItem("tgapp.tab"); if (t) tab = t; } catch (e) {}
+
+if (tg) { tg.ready(); tg.expand(); try { tg.disableVerticalSwipes && tg.disableVerticalSwipes(); } catch (e) {} }
+
+// ---------- helpers ----------
+const $ = (s) => document.querySelector(s);
+const esc = (v) => String(v ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+const st = (id) => (S && S.states[id]) || null;
+const val = (id) => { const x = st(id); return x ? x.s : null; };
+const num = (id) => { const v = parseFloat(val(id)); return Number.isFinite(v) ? v : null; };
+const attr = (id, k) => { const x = st(id); return x && x.a ? x.a[k] : undefined; };
+const fmt = (v, d = 0) => v == null ? "—" : Number(v).toLocaleString("uk-UA", {maximumFractionDigits: d, minimumFractionDigits: d});
+const fmtW = (w) => w == null ? "—" : Math.abs(w) >= 1000 ? fmt(w / 1000, 1) + " кВт" : fmt(w) + " Вт";
+const haptic = (t) => { try { tg && tg.HapticFeedback.impactOccurred(t || "light"); } catch (e) {} };
+const notify = (t) => { try { tg && tg.HapticFeedback.notificationOccurred(t); } catch (e) {} };
+function toast(text) {
+  if (tg && tg.showAlert) { try { tg.showAlert(text); return; } catch (e) {} }
+  alert(text);
+}
+function confirmBox(text) {
+  return new Promise(res => {
+    if (tg && tg.showConfirm) { try { tg.showConfirm(text, ok => res(!!ok)); return; } catch (e) {} }
+    res(confirm(text));
+  });
+}
+function since(iso) {
+  const t = Date.parse(String(iso).replace(" ", "T"));
+  if (!Number.isFinite(t)) return "";
+  const m = Math.max(0, Math.round((Date.now() - t) / 60000));
+  return m < 60 ? m + " хв" : Math.floor(m / 60) + " год " + (m % 60) + " хв";
+}
+function hhmm(iso) {
+  const d = new Date(String(iso).replace(" ", "T"));
+  return isNaN(d) ? "" : d.toLocaleTimeString("uk-UA", {hour: "2-digit", minute: "2-digit"});
+}
+
+// ---------- API ----------
+async function api(path, opts = {}) {
+  const r = await fetch(path, {
+    method: opts.method || "GET",
+    headers: Object.assign({"X-Telegram-Init-Data": INIT}, opts.body ? {"Content-Type": "application/json"} : {}),
+    body: opts.body ? JSON.stringify(opts.body) : undefined,
+    cache: "no-store",
+  });
+  let j = null; try { j = await r.json(); } catch (e) {}
+  if (!r.ok) { const err = new Error((j && (j.code || j.message)) || ("HTTP " + r.status)); err.status = r.status; err.code = j && j.code; throw err; }
+  return j;
+}
+
+async function load() {
+  try {
+    S = await api("/api/tgapp/state");
+    lastOk = Date.now();
+    render();
+  } catch (e) {
+    showError(e);
+  }
+  $("#foot").textContent = lastOk ? "Оновлено " + new Date(lastOk).toLocaleTimeString("uk-UA") : "";
+}
+
+function showError(e) {
+  if (S && e.status !== 401 && e.status !== 403) { $("#foot").textContent = "⚠️ Немає зв'язку з домом"; return; }
+  let m = "Не вдалося завантажити дані.";
+  if (!INIT) m = "Відкрий цю сторінку з Telegram-бота (кнопка меню).";
+  else if (e.code === "expired") m = "Сесія застаріла. Закрий і відкрий Mini App знову.";
+  else if (e.code === "forbidden") {
+    const id = tg && tg.initDataUnsafe && tg.initDataUnsafe.user ? tg.initDataUnsafe.user.id : "?";
+    m = "Немає доступу. Попроси додати твій Telegram ID: " + id;
+  } else if (e.status === 401) m = "Підпис Telegram не пройшов перевірку.";
+  $("#app").innerHTML = `<div class="msg">${esc(m)}</div>`;
+}
+
+async function act(body, label) {
+  const id = body.entity_id;
+  busy[id] = true; render();
+  try {
+    const r = await api("/api/tgapp/action", {method: "POST", body});
+    if (r && r.state) S.states[id] = r.state;
+    notify("success");
+  } catch (e) {
+    notify("error");
+    toast((label ? label + ": " : "") + (e.status === 429 ? "забагато команд, зачекай хвилину" : "не вдалося (" + e.message + ")"));
+  } finally {
+    delete busy[id]; render();
+    setTimeout(load, 2500);  // cloud devices confirm with a delay
+  }
+}
+
+function bumpTemp(id, delta, label) {
+  const step = Number(attr(id, "target_temp_step")) || 0.5;
+  const lo = Number(attr(id, "min_temp")) || 7, hi = Number(attr(id, "max_temp")) || 35;
+  const p = pendingTemp[id];
+  const cur = p ? p.value : Number(attr(id, "temperature"));
+  if (!Number.isFinite(cur)) return;
+  const next = Math.min(hi, Math.max(lo, Math.round((cur + delta * step) / step) * step));
+  haptic();
+  if (p) clearTimeout(p.timer);
+  pendingTemp[id] = {value: next, timer: setTimeout(() => {
+    delete pendingTemp[id];
+    act({action: "set_temperature", entity_id: id, temperature: next}, label);
+  }, 900)};
+  render();
+}
+
+// ---------- views ----------
+function viewEnergy() {
+  const E = S.layout.energy;
+  const grid = val(E.grid_connected) === "on";
+  const soc = num(E.battery_soc), bp = num(E.battery_power), pv = num(E.pv_power), load = num(E.load_power);
+  let gridLine;
+  if (grid) gridLine = `<span class="pill p-ok">🟢 Мережа є</span>`;
+  else {
+    const start = val(E.grid_outage_start);
+    gridLine = `<span class="pill p-bad">🔴 Немає мережі</span>` +
+      (start ? ` <span class="muted small">з ${esc(hhmm(start))} · ${esc(since(start))}</span>` : "");
+  }
+  // battery: positive = discharging (Deye convention)
+  let bLabel = "в спокої", left = "";
+  if (bp != null && bp > 30) {
+    bLabel = "розряд " + fmtW(bp);
+    if (soc != null) {
+      const kwh = (soc - E.battery_min_soc) / 100 * E.battery_capacity_kwh;
+      if (kwh > 0) { const h = kwh * 1000 / bp; left = `≈ ${h >= 1 ? fmt(h, 1) + " год" : Math.round(h * 60) + " хв"} до ${E.battery_min_soc}%`; }
+    }
+  } else if (bp != null && bp < -30) bLabel = "заряд " + fmtW(-bp);
+  const socColor = soc == null ? "var(--hint)" : soc < 30 ? "var(--bad)" : soc < 50 ? "var(--warn)" : "var(--ok)";
+  const volts = E.grid_voltage.map(num);
+  const phases = E.load_phase.map((id, i) => {
+    const w = num(id); const pct = w == null ? 0 : Math.min(100, w / E.phase_limit_w * 100);
+    const c = pct > 85 ? "var(--bad)" : pct > 60 ? "var(--warn)" : "var(--ok)";
+    return `<div class="phase"><span class="muted small">L${i + 1}</span><div class="bar"><i style="width:${pct}%;background:${c}"></i></div><span class="small" style="text-align:right">${fmtW(w)}</span></div>`;
+  }).join("");
+  const invState = val(E.inverter_state);
+  return `
+  <div class="card">
+    <div class="row between">${gridLine}</div>
+    <div class="row between" style="margin-top:12px;align-items:flex-end">
+      <div><div class="big" style="color:${socColor}">${fmt(soc)}%</div><div class="muted small">батарея · ${esc(bLabel)}</div></div>
+      <div style="text-align:right"><div class="mid">${fmtW(load)}</div><div class="muted small">споживання</div></div>
+    </div>
+    <div class="bar" style="margin-top:10px"><i style="width:${soc ?? 0}%;background:${socColor}"></i></div>
+    ${left ? `<div class="small muted" style="margin-top:6px">${esc(left)}</div>` : ""}
+  </div>
+  <div class="card grid2">
+    <div class="stat"><span>☀️ Сонце</span><b>${fmtW(pv)}</b></div>
+    <div class="stat"><span>🔋 Батарея</span><b>${fmt(num(E.battery_voltage), 1)} В · ${fmt(num(E.battery_temperature))}°</b></div>
+    <div class="stat" style="grid-column:1/-1"><span>🔌 Мережа L1 / L2 / L3</span><b>${volts.map(v => fmt(v)).join(" / ")} В</b></div>
+  </div>
+  <div class="card"><div class="title">Навантаження по фазах</div>${phases}</div>
+  <div class="card"><div class="title" style="margin-bottom:8px">Сьогодні, кВт·год</div>
+    <div class="grid4">
+      <div class="stat"><span>☀️</span><b>${fmt(num(E.day_pv), 1)}</b></div>
+      <div class="stat"><span>🏠</span><b>${fmt(num(E.day_load), 1)}</b></div>
+      <div class="stat"><span>⬇️ з мер.</span><b>${fmt(num(E.day_import), 1)}</b></div>
+      <div class="stat"><span>⬆️ в мер.</span><b>${fmt(num(E.day_export), 1)}</b></div>
+    </div></div>
+  <div class="card row between small"><span class="muted">Інвертор</span>
+    <span><span class="pill ${invState === "ok" ? "p-ok" : "p-warn"}">${esc(invState ?? "—")}</span> · радіатор ${fmt(num(E.inverter_temp))}°</span></div>`;
+}
+
+const ZONE_MODES = [["off", "Вимк"], ["heat_cool", "Ручний"], ["auto", "Розклад"]];
+
+function viewHeating() {
+  const H = S.layout.heating;
+  const pr = num(H.pressure);
+  const prColor = pr == null ? "inherit" : (pr < 1.0 || pr > 2.5) ? "var(--bad)" : pr < 1.2 ? "var(--warn)" : "inherit";
+  const zones = H.zones.map(z => {
+    const id = z.climate, x = st(id);
+    if (!x) return `<div class="card muted">${esc(z.icon)} ${esc(z.name)}: немає даних</div>`;
+    const mode = x.s, off = mode === "off", b = !!busy[id];
+    const p = pendingTemp[id];
+    const target = p ? p.value : attr(id, "temperature");
+    const special = val(z.special);
+    const action = attr(id, "hvac_action");
+    return `<div class="card ${b ? "pending" : ""}">
+      <div class="row between"><div class="title">${esc(z.icon)} ${esc(z.name)}</div>
+        <div>${special && special !== "None" && special !== "NONE" ? `<span class="pill p-warn">${esc(special)}</span> ` : ""}${action === "heating" ? `<span class="pill p-heat">гріє</span>` : ""}</div></div>
+      <div class="row between" style="margin-top:8px">
+        <div><div class="big">${fmt(attr(id, "current_temperature"), 1)}°</div><div class="muted small">вологість ${fmt(num(z.humidity))}%</div></div>
+        <div class="temp-ctl">
+          <button class="btn" data-temp="${id}" data-d="-1" ${off || b ? "disabled" : ""}>−</button>
+          <div class="val ${p ? "pending" : ""}">${off ? "—" : fmt(target, 1) + "°"}</div>
+          <button class="btn" data-temp="${id}" data-d="1" ${off || b ? "disabled" : ""}>+</button>
+        </div></div>
+      <div class="seg">${ZONE_MODES.filter(([m]) => (x.a.hvac_modes || []).includes(m)).map(([m, l]) =>
+        `<button class="btn ${mode === m ? "on" : ""}" data-mode="${id}" data-m="${m}" ${b ? "disabled" : ""}>${l}</button>`).join("")}</div>
+    </div>`;
+  }).join("");
+  const hp = H.heatpump, hpOn = val(hp.switch) === "on", hb = !!busy[hp.switch];
+  return `
+  <div class="card grid2" style="grid-template-columns:1fr 1fr 1fr">
+    <div class="stat"><span>🌡 Надворі</span><b>${fmt(num(H.outdoor), 1)}°</b></div>
+    <div class="stat"><span>💧 Тиск</span><b style="color:${prColor}">${fmt(pr, 1)} бар</b></div>
+    <div class="stat"><span>↗️ Подача</span><b>${fmt(num(H.flow), 1)}°</b></div>
+  </div>
+  ${zones}
+  <div class="card ${hb ? "pending" : ""}">
+    <div class="row between"><div class="title">♨️ Тепловий насос</div>
+      <span class="pill ${hpOn ? "p-heat" : "p-off"}">${hpOn ? "увімкнено" : "вимкнено"}</span></div>
+    <div class="grid2" style="margin-top:10px">
+      <div class="stat"><span>Температура</span><b>${fmt(num(hp.temperature), 1)}°</b></div>
+      <div class="stat"><span>Подача</span><b>${fmt(num(hp.flow), 1)}°</b></div>
+    </div>
+    <div class="seg"><button class="btn ${hpOn ? "" : "primary"}" data-hp="${hpOn ? "off" : "on"}" ${hb || !st(hp.switch) ? "disabled" : ""}>${hpOn ? "Вимкнути" : "Увімкнути"}</button></div>
+  </div>`;
+}
+
+const AC_MODES = [["heat", "🔥"], ["cool", "❄️"], ["auto", "🔄"], ["dry", "💧"], ["fan_only", "🌀"]];
+const AC_MODE_NAME = {heat: "обігрів", cool: "охолодження", auto: "авто", dry: "осушення", fan_only: "вентилятор", off: "вимкнено"};
+const FAN_NAME = {auto: "авто", low: "низька", middle_low: "нижче сер.", medium: "середня", middle_high: "вище сер.", high: "висока"};
+
+function lastAcMode(id) {
+  try { return localStorage.getItem("tgapp.ac." + id) || null; } catch (e) { return null; }
+}
+function rememberAcMode(id, m) { try { localStorage.setItem("tgapp.ac." + id, m); } catch (e) {} }
+
+function viewAc() {
+  return S.layout.ac.map(a => {
+    const id = a.climate, x = st(id);
+    if (!x) return `<div class="card muted">${esc(a.icon)} ${esc(a.name)}: немає даних</div>`;
+    const mode = x.s, off = mode === "off", b = !!busy[id];
+    const p = pendingTemp[id];
+    const target = p ? p.value : x.a.temperature;
+    const cls = off ? "p-off" : mode === "heat" ? "p-heat" : mode === "cool" ? "p-cool" : "p-ok";
+    const fans = x.a.fan_modes || [];
+    return `<div class="card ${b ? "pending" : ""}">
+      <div class="row between"><div class="title">${esc(a.icon)} ${esc(a.name)}</div>
+        <span class="pill ${cls}">${esc(AC_MODE_NAME[mode] || mode)}</span></div>
+      <div class="row between" style="margin-top:8px">
+        <div><div class="big">${fmt(x.a.current_temperature, 0)}°</div><div class="muted small">в кімнаті</div></div>
+        <div class="temp-ctl">
+          <button class="btn" data-temp="${id}" data-d="-1" ${off || b ? "disabled" : ""}>−</button>
+          <div class="val ${p ? "pending" : ""}">${off ? "—" : fmt(target, 0) + "°"}</div>
+          <button class="btn" data-temp="${id}" data-d="1" ${off || b ? "disabled" : ""}>+</button>
+        </div></div>
+      <div class="seg">
+        <button class="btn ${off ? "primary" : ""}" data-power="${id}" ${b ? "disabled" : ""}>${off ? "⏻ Увімкнути" : "⏻ Вимкнути"}</button>
+      </div>
+      <div class="seg">${AC_MODES.filter(([m]) => (x.a.hvac_modes || []).includes(m)).map(([m, l]) =>
+        `<button class="btn ${mode === m ? "on" : ""}" data-acmode="${id}" data-m="${m}" title="${AC_MODE_NAME[m]}" ${b ? "disabled" : ""}>${l}</button>`).join("")}</div>
+      ${fans.length && !off ? `<div class="row between" style="margin-top:10px"><span class="muted small">Вентилятор</span>
+        <select data-fan="${id}" ${b ? "disabled" : ""}>${fans.map(f => `<option value="${esc(f)}" ${f === x.a.fan_mode ? "selected" : ""}>${esc(FAN_NAME[f] || f)}</option>`).join("")}</select></div>` : ""}
+    </div>`;
+  }).join("");
+}
+
+function render() {
+  document.querySelectorAll(".tab").forEach(b => b.classList.toggle("on", b.dataset.tab === tab));
+  if (!S) return;
+  const v = tab === "heating" ? viewHeating() : tab === "ac" ? viewAc() : viewEnergy();
+  $("#app").innerHTML = v;
+}
+
+// ---------- events ----------
+$("#tabs").addEventListener("click", e => {
+  const b = e.target.closest(".tab"); if (!b) return;
+  tab = b.dataset.tab; haptic("soft");
+  try { localStorage.setItem("tgapp.tab", tab); } catch (e2) {}
+  render(); window.scrollTo(0, 0);
+});
+
+$("#app").addEventListener("click", async e => {
+  const b = e.target.closest("button"); if (!b || b.disabled) return;
+  if (b.dataset.temp) return bumpTemp(b.dataset.temp, Number(b.dataset.d));
+  if (b.dataset.mode) {
+    haptic();
+    return act({action: "set_hvac_mode", entity_id: b.dataset.mode, hvac_mode: b.dataset.m}, "Режим зони");
+  }
+  if (b.dataset.hp) {
+    const on = b.dataset.hp === "on";
+    if (!(await confirmBox(on ? "Увімкнути тепловий насос?" : "Вимкнути тепловий насос?"))) return;
+    return act({action: on ? "switch_on" : "switch_off", entity_id: S.layout.heating.heatpump.switch}, "Тепловий насос");
+  }
+  if (b.dataset.power) {
+    const id = b.dataset.power, x = st(id); haptic();
+    if (x.s === "off") {
+      const month = new Date().getMonth();
+      const fallback = (month >= 4 && month <= 8) ? "cool" : "heat";
+      const m = lastAcMode(id) || fallback;
+      return act({action: "set_hvac_mode", entity_id: id, hvac_mode: (x.a.hvac_modes || []).includes(m) ? m : fallback}, "Кондиціонер");
+    }
+    rememberAcMode(id, x.s);
+    return act({action: "set_hvac_mode", entity_id: id, hvac_mode: "off"}, "Кондиціонер");
+  }
+  if (b.dataset.acmode) {
+    haptic(); rememberAcMode(b.dataset.acmode, b.dataset.m);
+    return act({action: "set_hvac_mode", entity_id: b.dataset.acmode, hvac_mode: b.dataset.m}, "Режим кондиціонера");
+  }
+});
+
+$("#app").addEventListener("change", e => {
+  const s = e.target.closest("select[data-fan]"); if (!s) return;
+  act({action: "set_fan_mode", entity_id: s.dataset.fan, fan_mode: s.value}, "Вентилятор");
+});
+
+// ---------- polling ----------
+let timer = null;
+function startPolling() { if (!timer) timer = setInterval(() => { if (!document.hidden && !Object.keys(busy).length && !Object.keys(pendingTemp).length) load(); }, POLL_MS); }
+document.addEventListener("visibilitychange", () => { if (!document.hidden) load(); });
+render();
+load().then(startPolling);
+</script>
+</body>
+</html>
