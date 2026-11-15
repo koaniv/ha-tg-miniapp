@@ -31,6 +31,11 @@ ACTIONS_PER_MINUTE = 30
 # ---------------------------------------------------------------------------
 CONF_LAYOUT = "layout"
 
+# Estimated extra load (W) shown before a device is turned on during an outage.
+# Override per device with "power_w" in the layout.
+DEFAULT_HEATPUMP_POWER_W = 2000
+DEFAULT_AC_POWER_W = 1000
+
 EXAMPLE_LAYOUT: dict = {
     "energy": {
         "grid_connected": "binary_sensor.deye_grid_connected",
@@ -78,10 +83,11 @@ EXAMPLE_LAYOUT: dict = {
             "switch": "switch.heatpump",
             "temperature": "sensor.heatpump_temperature",
             "flow": "sensor.heatpump_flow_temperature",
+            "power_w": DEFAULT_HEATPUMP_POWER_W,
         },
     },
     "ac": [
-        {"name": "Bedroom", "icon": "🛏", "climate": "climate.bedroom_ac"},
+        {"name": "Bedroom", "icon": "🛏", "climate": "climate.bedroom_ac", "power_w": 1000},
     ],
 }
 
@@ -109,6 +115,8 @@ def parse_layout(raw: str | dict | None) -> dict:
         raise LayoutError("energy and heating must be objects")
     if not isinstance(layout["ac"], list) or not isinstance(heating["zones"], list):
         raise LayoutError("ac and heating.zones must be lists")
+    if not isinstance(heating["heatpump"], dict):
+        raise LayoutError("heating.heatpump must be an object")
     for key in ("grid_voltage", "load_phase"):
         energy.setdefault(key, [])
     energy.setdefault("battery_capacity_kwh", 10)
@@ -120,6 +128,13 @@ def parse_layout(raw: str | dict | None) -> dict:
     sw = heating["heatpump"].get("switch")
     if sw is not None and not str(sw).startswith(("switch.", "input_boolean.")):
         raise LayoutError("heatpump.switch must be a switch.* entity")
+    heating["heatpump"].setdefault("power_w", DEFAULT_HEATPUMP_POWER_W)
+    for item in layout["ac"]:
+        item.setdefault("power_w", DEFAULT_AC_POWER_W)
+    for item in [heating["heatpump"], *layout["ac"]]:
+        pw = item["power_w"]
+        if isinstance(pw, bool) or not isinstance(pw, (int, float)) or not 0 <= pw <= 20000:
+            raise LayoutError("power_w must be a number of watts (0-20000)")
     return layout
 
 

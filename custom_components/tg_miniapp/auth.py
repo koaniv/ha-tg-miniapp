@@ -11,8 +11,12 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import re
 import time
 from urllib.parse import parse_qsl
+
+
+_HASH_RE = re.compile(r"[0-9a-f]{64}")
 
 
 class InitDataError(Exception):
@@ -34,6 +38,10 @@ def validate_init_data(
     received_hash = data.pop("hash", None)
     if not received_hash:
         raise InitDataError("no hash")
+    # compare_digest() raises TypeError on non-ASCII str, which would turn a
+    # forged request into a 500 that bypasses the IP-ban accounting.
+    if not _HASH_RE.fullmatch(received_hash):
+        raise InitDataError("bad hash")
     # "signature" is for third-party validation; it is part of data_check_string
     # for the bot-token method, so it stays in `data`.
 

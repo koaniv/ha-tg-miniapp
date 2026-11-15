@@ -39,10 +39,19 @@ WWW = Path(__file__).parent / "www"
 
 # Telegram Web opens Mini Apps in an iframe. A CSP frame-ancestors header
 # overrides the X-Frame-Options: SAMEORIGIN that HA adds to every response.
+# The rest of the policy limits the page to its own inline code, the Telegram
+# SDK and its own API, so injected markup cannot load or send anything.
 PAGE_HEADERS = {
     "Content-Security-Policy": (
+        "default-src 'none'; "
+        "script-src 'unsafe-inline' https://telegram.org; "
+        "style-src 'unsafe-inline'; "
+        "img-src 'self' data:; "
+        "connect-src 'self'; "
+        "base-uri 'none'; form-action 'none'; "
         "frame-ancestors 'self' https://web.telegram.org https://*.telegram.org"
     ),
+    "Referrer-Policy": "no-referrer",
     "Cache-Control": "no-cache",
 }
 API_HEADERS = {"Cache-Control": "no-store"}
@@ -211,7 +220,9 @@ class ActionView(HomeAssistantView):
                 domain, service, data, blocking=True, context=None
             )
         except (HomeAssistantError, ValueError) as err:
-            return self.json_message(f"HA error: {err}", 502, headers=API_HEADERS)
+            # Details go to the log, not to the client.
+            _LOGGER.warning("Mini App: %s.%s failed: %s", domain, service, err)
+            return self.json_message("action failed", 502, headers=API_HEADERS)
         return self.json(
             {"ok": True, "state": _state_dict(hass, data["entity_id"])},
             headers=API_HEADERS,
