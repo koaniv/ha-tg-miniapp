@@ -1,0 +1,43 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Telegram Mini App",
+        "description": "Public HTTPS address of Home Assistant (Cloudflare tunnel). The Mini App opens at <address>/tgapp. Access: the private chats allowed in the Telegram bot integration, plus any extra Telegram user IDs.",
+        "data": {
+          "public_url": "Public URL",
+          "menu_text": "Menu button text",
+          "extra_user_ids": "Extra Telegram user IDs (comma-separated)",
+          "layout": "Layout (JSON, empty = example)"
+        }
+      }
+    },
+    "error": {
+      "https_required": "Must be an https:// address",
+      "bad_ids": "Only numeric IDs, separated by commas",
+      "bad_layout": "Layout is not valid: check the JSON and that every zone/AC has a climate.* entity"
+    },
+    "abort": {
+      "single_instance_allowed": "Already configured",
+      "no_telegram_bot": "Set up the Telegram bot integration first"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Telegram Mini App",
+        "data": {
+          "public_url": "Public URL",
+          "menu_text": "Menu button text",
+          "extra_user_ids": "Extra Telegram user IDs (comma-separated)",
+          "layout": "Layout (JSON, empty = example)"
+        }
+      }
+    },
+    "error": {
+      "https_required": "Must be an https:// address",
+      "bad_ids": "Only numeric IDs, separated by commas",
+      "bad_layout": "Layout is not valid: check the JSON and that every zone/AC has a climate.* entity"
+    }
+  }
+}

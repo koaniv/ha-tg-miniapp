@@ -1,0 +1,43 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Telegram Mini App",
+        "description": "Публічна HTTPS-адреса Home Assistant (тунель Cloudflare). Mini App відкриватиметься за адресою <адреса>/tgapp. Доступ мають приватні чати, дозволені в інтеграції Telegram bot, і додаткові Telegram ID, якщо вкажеш.",
+        "data": {
+          "public_url": "Публічна адреса",
+          "menu_text": "Текст кнопки меню",
+          "extra_user_ids": "Додаткові Telegram ID (через кому)",
+          "layout": "Розкладка екранів (JSON; порожньо = приклад)"
+        }
+      }
+    },
+    "error": {
+      "https_required": "Адреса має починатися з https://",
+      "bad_ids": "Тільки числові ID через кому",
+      "bad_layout": "Розкладка некоректна: перевір JSON і що кожна зона чи кондиціонер має сутність climate.*"
+    },
+    "abort": {
+      "single_instance_allowed": "Вже налаштовано",
+      "no_telegram_bot": "Спершу налаштуй інтеграцію Telegram bot"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Telegram Mini App",
+        "data": {
+          "public_url": "Публічна адреса",
+          "menu_text": "Текст кнопки меню",
+          "extra_user_ids": "Додаткові Telegram ID (через кому)",
+          "layout": "Розкладка екранів (JSON; порожньо = приклад)"
+        }
+      }
+    },
+    "error": {
+      "https_required": "Адреса має починатися з https://",
+      "bad_ids": "Тільки числові ID через кому",
+      "bad_layout": "Розкладка некоректна: перевір JSON і що кожна зона чи кондиціонер має сутність climate.*"
+    }
+  }
+}
