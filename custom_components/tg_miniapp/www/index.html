@@ -64,6 +64,9 @@ select{font:inherit;border:0;border-radius:10px;padding:8px;background:var(--sof
 .msg{text-align:center;padding:40px 16px;color:var(--hint)}
 .foot{text-align:center;font-size:12px;color:var(--hint);margin-top:6px}
 .hidden{display:none}
+.banner{display:flex;align-items:center;gap:8px;border-radius:12px;padding:10px 12px;margin:0 0 10px;
+  background:color-mix(in srgb,var(--bad) 14%,var(--card));color:var(--text);font-size:14px}
+.banner b{color:var(--bad)}
 </style>
 </head>
 <body>
@@ -120,6 +123,42 @@ function since(iso) {
 function hhmm(iso) {
   const d = new Date(String(iso).replace(" ", "T"));
   return isNaN(d) ? "" : d.toLocaleTimeString("uk-UA", {hour: "2-digit", minute: "2-digit"});
+}
+
+// ---------- outage ----------
+function gridDown() {
+  const id = S && S.layout.energy.grid_connected;
+  return !!id && val(id) === "off";
+}
+function outageBanner() {
+  if (!gridDown()) return "";
+  const E = S.layout.energy, start = val(E.grid_outage_start), soc = num(E.battery_soc);
+  const when = start ? ` з ${esc(hhmm(start))} (${esc(since(start))})` : "";
+  return `<div class="banner">🔴 <div><b>Мережі немає</b>${when}. Живлення від батареї: ${fmt(soc)}%.</div></div>`;
+}
+// Text of the confirmation shown before a device is turned on during an outage.
+function loadWarning(name, addW) {
+  const E = S.layout.energy;
+  const soc = num(E.battery_soc), bp = num(E.battery_power), load = num(E.load_power);
+  const lines = [`Мережі немає. ${name} додасть ≈ ${fmtW(addW)} навантаження.`];
+  if (load != null) lines.push(`Споживання: ${fmtW(load)} → ≈ ${fmtW(load + addW)}.`);
+  if (soc != null) {
+    let s = `Батарея: ${fmt(soc)}%`;
+    const draw = (bp ?? 0) + addW;  // Deye: positive battery power = discharge
+    const kwh = (soc - E.battery_min_soc) / 100 * E.battery_capacity_kwh;
+    if (kwh <= 0) s += `, вже на мінімумі (${E.battery_min_soc}%)`;
+    else if (draw > 30) {
+      const h = kwh * 1000 / draw;
+      s += `, вистачить ≈ ${h >= 1 ? fmt(h, 1) + " год" : Math.round(h * 60) + " хв"} до ${E.battery_min_soc}%`;
+    }
+    lines.push(s + ".");
+  }
+  lines.push("Увімкнути?");
+  return lines.join("\n");
+}
+async function confirmTurnOn(name, addW) {
+  if (!gridDown()) return true;
+  return confirmBox(loadWarning(name, Number(addW) || 0));
 }
 
 // ---------- API ----------
@@ -275,7 +314,7 @@ function viewHeating() {
     </div>`;
   }).join("");
   const hp = H.heatpump, hpOn = val(hp.switch) === "on", hb = !!busy[hp.switch];
-  return `
+  return outageBanner() + `
   <div class="card grid2" style="grid-template-columns:1fr 1fr 1fr">
     <div class="stat"><span>🌡 Надворі</span><b>${fmt(num(H.outdoor), 1)}°</b></div>
     <div class="stat"><span>💧 Тиск</span><b style="color:${prColor}">${fmt(pr, 1)} бар</b></div>
@@ -302,8 +341,12 @@ function lastAcMode(id) {
 }
 function rememberAcMode(id, m) { try { localStorage.setItem("tgapp.ac." + id, m); } catch (e) {} }
 
+const acItem = (id) => S.layout.ac.find(a => a.climate === id) || {};
+const acName = (id) => acItem(id).name || id;
+const acPower = (id) => acItem(id).power_w;
+
 function viewAc() {
-  return S.layout.ac.map(a => {
+  return outageBanner() + S.layout.ac.map(a => {
     const id = a.climate, x = st(id);
     if (!x) return `<div class="card muted">${esc(a.icon)} ${esc(a.name)}: немає даних</div>`;
     const mode = x.s, off = mode === "off", b = !!busy[id];
@@ -356,12 +399,16 @@ $("#app").addEventListener("click", async e => {
   }
   if (b.dataset.hp) {
     const on = b.dataset.hp === "on";
-    if (!(await confirmBox(on ? "Увімкнути тепловий насос?" : "Вимкнути тепловий насос?"))) return;
+    const hp = S.layout.heating.heatpump;
+    const ok = on && gridDown() ? await confirmTurnOn("Тепловий насос", hp.power_w)
+      : await confirmBox(on ? "Увімкнути тепловий насос?" : "Вимкнути тепловий насос?");
+    if (!ok) return;
     return act({action: on ? "switch_on" : "switch_off", entity_id: S.layout.heating.heatpump.switch}, "Тепловий насос");
   }
   if (b.dataset.power) {
     const id = b.dataset.power, x = st(id); haptic();
     if (x.s === "off") {
+      if (!(await confirmTurnOn("Кондиціонер «" + acName(id) + "»", acPower(id)))) return;
       const month = new Date().getMonth();
       const fallback = (month >= 4 && month <= 8) ? "cool" : "heat";
       const m = lastAcMode(id) || fallback;
@@ -371,7 +418,10 @@ $("#app").addEventListener("click", async e => {
     return act({action: "set_hvac_mode", entity_id: id, hvac_mode: "off"}, "Кондиціонер");
   }
   if (b.dataset.acmode) {
-    haptic(); rememberAcMode(b.dataset.acmode, b.dataset.m);
+    const id = b.dataset.acmode, x = st(id);
+    if (x && x.s === "off" && b.dataset.m !== "off" &&
+        !(await confirmTurnOn("Кондиціонер «" + acName(id) + "»", acPower(id)))) return;
+    haptic(); rememberAcMode(id, b.dataset.m);
     return act({action: "set_hvac_mode", entity_id: b.dataset.acmode, hvac_mode: b.dataset.m}, "Режим кондиціонера");
   }
 });
