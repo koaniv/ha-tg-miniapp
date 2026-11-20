@@ -23,8 +23,11 @@ html,body{margin:0;background:var(--bg);color:var(--text);
   font:15px/1.35 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
 body{padding:0 12px calc(16px + env(safe-area-inset-bottom))}
 .tabs{position:sticky;top:0;z-index:5;display:flex;gap:4px;padding:10px 0 8px;background:var(--bg)}
-.tab{flex:1;border:0;border-radius:10px;padding:9px 4px;font:inherit;font-weight:600;
+.tab{flex:1;min-width:0;border:0;border-radius:10px;padding:9px 2px;font:inherit;font-weight:600;font-size:14px;white-space:nowrap;
   background:var(--card);color:var(--hint);cursor:pointer}
+.refresh{flex:none;width:42px;border:0;border-radius:10px;background:var(--card);color:var(--text);cursor:pointer;font-size:18px}
+.refresh.spin span{display:inline-block;animation:spin .8s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
 .tab.on{background:var(--btn);color:var(--btn-text)}
 .card{background:var(--card);border-radius:14px;padding:14px;margin:0 0 10px}
 .row{display:flex;align-items:center;gap:10px}
@@ -69,6 +72,39 @@ select{font:inherit;border:0;border-radius:10px;padding:8px;background:var(--sof
 .banner b{color:var(--bad)}
 .wait{display:inline-block;animation:blink 1.4s ease-in-out infinite}
 @keyframes blink{50%{opacity:.35}}
+.p-sync{background:color-mix(in srgb,var(--btn) 18%,transparent);color:var(--btn)}
+/* metrics row: number, smaller unit, label under it, thin dividers */
+.metrics{display:grid;grid-template-columns:repeat(4,1fr);padding:14px 4px 12px}
+.m{position:relative;display:flex;flex-direction:column;align-items:center;gap:3px;min-width:0}
+.m+.m::before{content:"";position:absolute;left:0;top:10%;bottom:10%;width:1px;background:var(--sep)}
+.mv{font-size:20px;font-weight:650;letter-spacing:-.02em;font-variant-numeric:tabular-nums;line-height:1.1;white-space:nowrap}
+.mv small{font-size:12px;font-weight:500;letter-spacing:0;color:var(--hint);margin-left:2px}
+.ml{display:flex;align-items:center;gap:5px;font-size:11.5px;color:var(--hint);white-space:nowrap}
+.dot{width:6px;height:6px;border-radius:50%;background:currentColor;flex:none}
+/* quick toggles */
+.quick{display:grid;gap:8px;margin:0 0 10px}
+.qbtn{border:0;border-radius:14px;padding:12px 8px;background:var(--card);color:var(--text);cursor:pointer;text-align:left;
+  display:flex;flex-direction:column;gap:4px;min-height:92px;font:inherit}
+.qbtn .ic{font-size:22px;line-height:1}
+.qbtn .lb{font-weight:650;font-size:14px;line-height:1.15}
+.qbtn .st{font-size:12px;color:var(--hint);line-height:1.2}
+.qbtn.on{background:var(--btn);color:var(--btn-text)}
+.qbtn.on .st{color:color-mix(in srgb,var(--btn-text) 80%,transparent)}
+.qbtn[disabled]{opacity:.4}
+.qbtn.pend{animation:blink 1.4s ease-in-out infinite}
+.locked{opacity:.55}
+.lockline{margin-top:10px;font-size:13px;color:var(--hint)}
+/* in-page chooser (Telegram popups allow only 3 buttons) */
+.overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:50;padding:16px}
+.sheet{background:var(--card);border-radius:16px;width:min(330px,100%);padding:18px 18px 8px;box-shadow:0 10px 40px rgba(0,0,0,.35)}
+.sheet h3{margin:0 0 8px;font-size:17px}
+.sheet p{margin:0 0 12px;white-space:pre-line;font-size:14.5px}
+.chips{display:flex;gap:6px;flex-wrap:wrap;margin:0 0 12px}
+.chip{border:0;border-radius:99px;padding:6px 11px;background:var(--soft);color:var(--text);cursor:pointer;font:inherit;font-size:13.5px;font-weight:600}
+.chip.on{background:var(--btn);color:var(--btn-text)}
+.sbtns{display:flex;justify-content:flex-end;gap:4px;border-top:1px solid var(--sep);padding-top:6px}
+.sbtns button{border:0;background:none;color:var(--link);font:inherit;font-weight:650;padding:10px 12px;cursor:pointer;border-radius:8px}
+@media (prefers-reduced-motion:reduce){.wait,.qbtn.pend,.refresh.spin span{animation:none}}
 </style>
 </head>
 <body>
@@ -76,7 +112,9 @@ select{font:inherit;border:0;border-radius:10px;padding:8px;background:var(--sof
   <button class="tab on" data-tab="energy">⚡ Енергія</button>
   <button class="tab" data-tab="heating">🔥 Опалення</button>
   <button class="tab" data-tab="ac">❄️ Кондиц.</button>
+  <button class="refresh" id="refresh" title="Оновити все" aria-label="Оновити все"><span>↻</span></button>
 </nav>
+<div id="sheet-root"></div>
 <main id="app"><div class="msg">Завантаження…</div></main>
 <div class="foot" id="foot"></div>
 
@@ -207,16 +245,22 @@ function showError(e) {
   $("#app").innerHTML = `<div class="msg">${esc(m)}</div>`;
 }
 
-async function act(body, label) {
-  const id = body.entity_id;
+const ERR_TEXT = {
+  away_mode: "увімкнено режим відсутності, спершу вимкни його",
+  syncing: "оновлюю стан Vaillant, зачекай кілька секунд",
+};
+async function act(body, label, key) {
+  const id = key || body.entity_id;
   busy[id] = true; render();
   try {
     const r = await api("/api/tgapp/action", {method: "POST", body});
-    if (r && r.state) S.states[id] = r.state;
+    if (r && r.states) Object.assign(S.states, r.states);
+    else if (r && r.state) S.states[id] = r.state;
     notify("success");
   } catch (e) {
     notify("error");
-    toast((label ? label + ": " : "") + (e.status === 429 ? "забагато команд, зачекай хвилину" : "не вдалося (" + e.message + ")"));
+    toast((label ? label + ": " : "") + (e.status === 429 ? "забагато команд, зачекай хвилину"
+      : ERR_TEXT[e.code] || "не вдалося (" + e.message + ")"));
   } finally {
     delete busy[id]; render();
     setTimeout(load, 2500);  // cloud devices confirm with a delay
@@ -299,63 +343,89 @@ function viewEnergy() {
 
 const ZONE_MODES = [["off", "Вимк"], ["heat_cool", "Ручний"], ["auto", "Розклад"]];
 
-function viewHeating() {
-  const H = S.layout.heating;
-  const pr = num(H.pressure);
-  const prColor = pr == null ? "inherit" : (pr < 1.0 || pr > 2.5) ? "var(--bad)" : pr < 1.2 ? "var(--warn)" : "inherit";
-  const zones = H.zones.map(z => {
-    const id = z.climate, x = st(id);
-    if (!x) return `<div class="card muted">${esc(z.icon)} ${esc(z.name)}: немає даних</div>`;
-    const mode = x.s, off = mode === "off", b = !!busy[id];
-    const p = pendingTemp[id];
-    const target = p ? p.value : attr(id, "temperature");
-    const special = val(z.special);
-    const action = attr(id, "hvac_action");
-    return `<div class="card ${b ? "pending" : ""}">
-      <div class="row between"><div class="title">${esc(z.icon)} ${esc(z.name)}</div>
-        <div>${pendPill(id)}${special && special !== "None" && special !== "NONE" ? `<span class="pill p-warn">${esc(special)}</span> ` : ""}${action === "heating" && !isPending(id) ? `<span class="pill p-heat">гріє</span>` : ""}</div></div>
-      <div class="row between" style="margin-top:8px">
-        <div><div class="big">${fmt(attr(id, "current_temperature"), 1)}°</div><div class="muted small">вологість ${fmt(num(z.humidity))}%</div></div>
-        <div class="temp-ctl">
-          <button class="btn" data-temp="${id}" data-d="-1" ${off || b ? "disabled" : ""}>−</button>
-          <div class="val ${p ? "pending" : ""}">${off ? "—" : fmt(target, 1) + "°"}</div>
-          <button class="btn" data-temp="${id}" data-d="1" ${off || b ? "disabled" : ""}>+</button>
-        </div></div>
-      <div class="seg">${ZONE_MODES.filter(([m]) => (x.a.hvac_modes || []).includes(m)).map(([m, l]) =>
-        `<button class="btn ${mode === m ? "on" : ""}" data-mode="${id}" data-m="${m}" ${b ? "disabled" : ""}>${l}</button>`).join("")}</div>
-    </div>`;
-  }).join("");
-  const hp = H.heatpump, hpOn = val(hp.switch) === "on", hb = !!busy[hp.switch];
-  return outageBanner() + awayCard(H.away || {}) + `
-  <div class="card grid2" style="grid-template-columns:1fr 1fr 1fr">
-    <div class="stat"><span>🌡 Надворі</span><b>${fmt(num(H.outdoor), 1)}°</b></div>
-    <div class="stat"><span>💧 Тиск</span><b style="color:${prColor}">${fmt(pr, 1)} бар</b></div>
-    <div class="stat"><span>↗️ Подача</span><b>${fmt(num(H.flow), 1)}°</b></div>
-  </div>
-  ${zones}
-  ${dhwCard(H.dhw || {})}
-  <div class="card ${hb ? "pending" : ""}">
-    <div class="row between"><div class="title">♨️ Тепловий насос</div>
-      <span>${pendPill(hp.switch)}<span class="pill ${hpOn ? "p-heat" : "p-off"}">${hpOn ? "увімкнено" : "вимкнено"}</span></span></div>
-    <div class="grid2" style="margin-top:10px">
-      <div class="stat"><span>Температура</span><b>${fmt(num(hp.temperature), 1)}°</b></div>
-      <div class="stat"><span>Подача</span><b>${fmt(num(hp.flow), 1)}°</b></div>
-    </div>
-    <div class="seg"><button class="btn ${hpOn ? "" : "primary"}" data-hp="${hpOn ? "off" : "on"}" ${hb || !st(hp.switch) ? "disabled" : ""}>${hpOn ? "Вимкнути" : "Увімкнути"}</button></div>
-  </div>`;
+// ---------- heating ----------
+const awaySw = () => (S.layout.heating.away || {}).switch;
+const awayOn = () => !!awaySw() && val(awaySw()) === "on";
+// After away mode ends the zones and hot water are re-read from the cloud.
+const syncing = () => (S.sync || 0) > 0 || (!!awaySw() && isPending(awaySw()) && val(awaySw()) === "off");
+const vaillantLocked = () => awayOn() || syncing();
+const syncPill = () => syncing() ? `<span class="pill p-sync wait">⟳ синхронізація</span>` : "";
+const offPill = `<span class="pill p-off">⏹ вимкнено</span>`;
+const heatPill = `<span class="pill p-heat">🔥 гріє</span>`;
+const lockLine = () => awayOn() ? `<div class="lockline">🔒 Увімкнено режим відсутності. Щоб змінити, вимкни його.</div>`
+  : syncing() ? `<div class="lockline">⟳ Оновлюю стан після режиму відсутності…</div>` : "";
+
+function metric(value, digits, unit, label, color) {
+  const c = color && color !== "inherit" ? color : "";
+  return `<div class="m"><span class="mv"${c ? ` style="color:${c}"` : ""}>${fmt(value, digits)}<small>${unit}</small></span>` +
+    `<span class="ml"${c ? ` style="color:${c}"` : ""}>${c ? `<i class="dot"></i>` : ""}${label}</span></div>`;
 }
 
-function awayCard(A) {
-  const id = A.switch; if (!id) return "";
-  const x = st(id);
-  if (!x) return `<div class="card muted">🧳 Режим відсутності: немає даних</div>`;
-  const on = x.s === "on", b = !!busy[id], end = x.a.holiday_end_date_time;
-  const sub = on ? (end && !isPending(id) ? "до " + esc(dateTime(end)) : "увімкнено") : "вимкнено";
-  return `<div class="card ${b ? "pending" : ""}">
-    <div class="row between">
-      <div><div class="title">🧳 Режим відсутності</div><div class="muted small">${pendPill(id)}${sub}</div></div>
-      <button class="btn ${on ? "primary" : ""}" data-away="${on ? "off" : "on"}" ${b ? "disabled" : ""}>${on ? "Вимкнути" : "Увімкнути"}</button>
-    </div></div>`;
+function heatingMetrics(H) {
+  const pr = num(H.pressure);
+  const prColor = pr == null ? "" : (pr < 1.0 || pr > 2.5) ? "var(--bad)" : pr < 1.2 ? "var(--warn)" : "";
+  const dhw = (H.dhw || {}).water_heater;
+  const items = [
+    metric(num(H.outdoor), 1, "°C", "надворі"),
+    metric(pr, 1, "бар", "тиск", prColor),
+    metric(num(H.flow), 1, "°C", "подача"),
+  ];
+  if (dhw) items.push(metric(attr(dhw, "current_temperature"), 1, "°C", "гаряча вода"));
+  return `<div class="card metrics" style="grid-template-columns:repeat(${items.length},1fr)">${items.join("")}</div>`;
+}
+
+function quickButtons(H) {
+  const btns = [];
+  const aw = awaySw();
+  if (aw && st(aw)) {
+    const on = awayOn(), pend = isPending(aw) || !!busy.away || !!busy[aw];
+    const end = attr(aw, "holiday_end_date_time");
+    const sub = pend ? "застосовується…" : on ? (end ? "до " + esc(dateTime(end)) : "увімкнено") : "вимкнено";
+    btns.push(`<button class="qbtn ${on ? "on" : ""} ${pend ? "pend" : ""}" data-q="away" ${pend ? "disabled" : ""}>
+      <span class="ic">🧳</span><span class="lb">Відсутність</span><span class="st">${sub}</span></button>`);
+  }
+  if (H.zones.length) {
+    const known = H.zones.filter(z => st(z.climate));
+    const onCount = known.filter(z => val(z.climate) !== "off").length;
+    const pend = !!busy.zones || known.some(z => isPending(z.climate));
+    const lock = vaillantLocked();
+    const sub = pend ? "застосовується…" : awayOn() ? "заблоковано відсутністю" : syncing() ? "синхронізація…"
+      : onCount === 0 ? "вимкнено" : onCount === known.length ? "усі зони" : `${onCount} з ${known.length} зон`;
+    btns.push(`<button class="qbtn ${onCount && !lock ? "on" : ""} ${pend ? "pend" : ""}" data-q="heat" ${lock || pend || !known.length ? "disabled" : ""}>
+      <span class="ic">🔥</span><span class="lb">Опалення</span><span class="st">${sub}</span></button>`);
+  }
+  const hp = H.heatpump.switch;
+  if (hp && st(hp)) {
+    const on = val(hp) === "on", pend = isPending(hp) || !!busy[hp];
+    btns.push(`<button class="qbtn ${on ? "on" : ""} ${pend ? "pend" : ""}" data-q="hp" ${pend ? "disabled" : ""}>
+      <span class="ic">♨️</span><span class="lb">Тепловий насос</span><span class="st">${pend ? "застосовується…" : on ? "працює" : "вимкнено"}</span></button>`);
+  }
+  return btns.length ? `<div class="quick" style="grid-template-columns:repeat(${btns.length},1fr)">${btns.join("")}</div>` : "";
+}
+
+function zoneCard(z) {
+  const id = z.climate, x = st(id);
+  if (!x) return `<div class="card muted">${esc(z.icon)} ${esc(z.name)}: немає даних</div>`;
+  const mode = x.s, off = mode === "off", lock = vaillantLocked(), dis = lock || !!busy[id] || !!busy.zones;
+  const p = pendingTemp[id];
+  const target = p ? p.value : attr(id, "temperature");
+  const special = val(z.special);
+  const specialPill = special && !["None", "NONE", "none"].includes(special) ? `<span class="pill p-warn">${esc(special)}</span>` : "";
+  const status = syncPill() || pendPill(id) || (off ? offPill : attr(id, "hvac_action") === "heating" ? heatPill : "");
+  return `<div class="card ${lock ? "locked" : ""} ${busy[id] ? "pending" : ""}">
+    <div class="row between"><div class="title">${esc(z.icon)} ${esc(z.name)}</div>
+      <div class="row" style="gap:6px">${specialPill}${status}</div></div>
+    <div class="row between" style="margin-top:8px">
+      <div><div class="big">${fmt(attr(id, "current_temperature"), 1)}°</div><div class="muted small">вологість ${fmt(num(z.humidity))}%</div></div>
+      <div class="temp-ctl">
+        <button class="btn" data-temp="${id}" data-d="-1" ${off || dis ? "disabled" : ""}>−</button>
+        <div class="val ${p ? "pending" : ""}">${off ? "—" : fmt(target, 1) + "°"}</div>
+        <button class="btn" data-temp="${id}" data-d="1" ${off || dis ? "disabled" : ""}>+</button>
+      </div></div>
+    <div class="seg">${ZONE_MODES.filter(([m]) => (x.a.hvac_modes || []).includes(m)).map(([m, l]) =>
+      `<button class="btn ${mode === m ? "on" : ""}" data-mode="${id}" data-m="${m}" ${dis ? "disabled" : ""}>${l}</button>`).join("")}</div>
+    ${lockLine()}
+  </div>`;
 }
 
 const DHW_MODES = {"Manual": "Ручний", "Time Controlled": "Розклад", "Off": "Вимк", "Cylinder Boost": "Буст"};
@@ -365,24 +435,98 @@ function dhwCard(D) {
   const id = D.water_heater; if (!id) return "";
   const x = st(id);
   if (!x) return `<div class="card muted">🚿 Гаряча вода: немає даних</div>`;
-  const mode = x.a.operation_mode || x.s, off = mode === "Off" || mode === "off", b = !!busy[id];
+  const mode = x.a.operation_mode || x.s, off = mode === "Off" || mode === "off";
+  const lock = vaillantLocked(), dis = lock || !!busy[id];
   const p = pendingTemp[id];
   const target = p ? p.value : x.a.temperature;
   const modes = x.a.operation_list || [];
-  const cls = off ? "p-off" : mode === "Cylinder Boost" ? "p-heat" : "p-ok";
-  return `<div class="card ${b ? "pending" : ""}">
-    <div class="row between"><div class="title">🚿 Гаряча вода</div>
-      ${isPending(id) ? pendPill(id) : `<span class="pill ${cls}">${esc(dhwName(mode))}</span>`}</div>
+  const status = syncPill() || pendPill(id) || (off ? offPill
+    : `<span class="pill ${mode === "Cylinder Boost" ? "p-heat" : "p-ok"}">${mode === "Cylinder Boost" ? "🔥 " : ""}${esc(dhwName(mode))}</span>`);
+  return `<div class="card ${lock ? "locked" : ""} ${busy[id] ? "pending" : ""}">
+    <div class="row between"><div class="title">🚿 Гаряча вода</div>${status}</div>
     <div class="row between" style="margin-top:8px">
       <div><div class="big">${fmt(x.a.current_temperature, 1)}°</div><div class="muted small">в бойлері</div></div>
       <div class="temp-ctl">
-        <button class="btn" data-temp="${id}" data-d="-1" ${off || b ? "disabled" : ""}>−</button>
+        <button class="btn" data-temp="${id}" data-d="-1" ${off || dis ? "disabled" : ""}>−</button>
         <div class="val ${p ? "pending" : ""}">${off ? "—" : fmt(target, 0) + "°"}</div>
-        <button class="btn" data-temp="${id}" data-d="1" ${off || b ? "disabled" : ""}>+</button>
+        <button class="btn" data-temp="${id}" data-d="1" ${off || dis ? "disabled" : ""}>+</button>
       </div></div>
     <div class="seg">${modes.map(m =>
-      `<button class="btn ${mode === m ? "on" : ""}" data-dhwmode="${id}" data-m="${esc(m)}" ${b ? "disabled" : ""}>${esc(dhwName(m))}</button>`).join("")}</div>
+      `<button class="btn ${mode === m ? "on" : ""}" data-dhwmode="${id}" data-m="${esc(m)}" ${dis ? "disabled" : ""}>${esc(dhwName(m))}</button>`).join("")}</div>
+    ${lockLine()}
   </div>`;
+}
+
+function heatpumpCard(hp) {
+  if (!hp.switch && !hp.temp_heating && !hp.flow) return "";
+  const on = val(hp.switch) === "on";
+  const status = pendPill(hp.switch) || (on ? `<span class="pill p-heat">🔥 працює</span>` : offPill);
+  return `<div class="card">
+    <div class="row between"><div class="title">♨️ Тепловий насос</div>${hp.switch ? status : ""}</div>
+    <div class="metrics" style="grid-template-columns:1fr 1fr;padding:14px 0 2px">
+      ${metric(num(hp.temp_heating || hp.flow), 1, "°C", "опалення")}
+      ${metric(num(hp.temp_dhw || hp.temperature), 1, "°C", "гаряча вода")}
+    </div>
+  </div>`;
+}
+
+function viewHeating() {
+  const H = S.layout.heating;
+  return outageBanner() + heatingMetrics(H) + quickButtons(H) +
+    H.zones.map(zoneCard).join("") + dhwCard(H.dhw || {}) + heatpumpCard(H.heatpump);
+}
+
+// In-page chooser: Telegram popups allow at most three buttons.
+function choose(title, text, options, okText) {
+  return new Promise(res => {
+    const root = $("#sheet-root");
+    let chosen = options[0][0];
+    root.innerHTML = `<div class="overlay" role="dialog" aria-modal="true"><div class="sheet">
+      <h3>${esc(title)}</h3><p>${esc(text)}</p>
+      <div class="chips">${options.map(([v, l], i) => `<button class="chip ${i ? "" : "on"}" data-v="${i}">${esc(l)}</button>`).join("")}</div>
+      <div class="sbtns"><button data-a="no">Скасувати</button><button data-a="yes">${esc(okText)}</button></div>
+    </div></div>`;
+    const close = (v) => { root.innerHTML = ""; res(v); };
+    root.querySelector(".overlay").addEventListener("click", e => {
+      const c = e.target.closest(".chip");
+      if (c) { chosen = options[Number(c.dataset.v)][0]; root.querySelectorAll(".chip").forEach(x => x.classList.toggle("on", x === c)); return; }
+      const b = e.target.closest("[data-a]");
+      if (b) close(b.dataset.a === "yes" ? {value: chosen} : null);
+      else if (e.target.classList.contains("overlay")) close(null);
+    });
+  });
+}
+
+async function onQuick(q) {
+  const H = S.layout.heating;
+  haptic();
+  if (q === "away") {
+    const sw = awaySw();
+    if (awayOn()) {
+      if (!await confirmBox("Вимкнути режим відсутності? Опалення і гаряча вода повернуться до звичайних режимів, стан Vaillant оновиться.")) return;
+      return act({action: "switch_off", entity_id: sw}, "Режим відсутності", "away");
+    }
+    const r = await choose("Режим відсутності", "Опалення і гаряча вода перейдуть на мінімум, керування зонами буде заблоковане.\nНа скільки?",
+      [[null, "До скасування"], [1, "1 день"], [3, "3 дні"], [7, "7 днів"]], "Увімкнути");
+    if (!r) return;
+    return act({action: "away_on", days: r.value}, "Режим відсутності", "away");
+  }
+  if (q === "heat") {
+    const anyOn = H.zones.some(z => st(z.climate) && val(z.climate) !== "off");
+    if (anyOn) {
+      if (!await confirmBox("Вимкнути опалення в усіх зонах?")) return;
+      return act({action: "zones_off"}, "Опалення", "zones");
+    }
+    if (!await confirmBox("Увімкнути опалення в усіх зонах? Кожна зона повернеться в свій останній режим (або «Розклад»).")) return;
+    return act({action: "zones_on"}, "Опалення", "zones");
+  }
+  if (q === "hp") {
+    const hp = H.heatpump, on = val(hp.switch) === "on";
+    const ok = !on && gridDown() ? await confirmTurnOn("Тепловий насос", hp.power_w)
+      : await confirmBox(on ? "Вимкнути тепловий насос?" : "Увімкнути тепловий насос?");
+    if (!ok) return;
+    return act({action: on ? "switch_off" : "switch_on", entity_id: hp.switch}, "Тепловий насос");
+  }
 }
 
 const AC_MODES = [["heat", "🔥"], ["cool", "❄️"], ["auto", "🔄"], ["dry", "💧"], ["fan_only", "🌀"]];
@@ -454,23 +598,7 @@ $("#app").addEventListener("click", async e => {
     haptic();
     return act({action: "set_hvac_mode", entity_id: b.dataset.mode, hvac_mode: b.dataset.m}, "Режим зони");
   }
-  if (b.dataset.hp) {
-    const on = b.dataset.hp === "on";
-    const hp = S.layout.heating.heatpump;
-    const ok = on && gridDown() ? await confirmTurnOn("Тепловий насос", hp.power_w)
-      : await confirmBox(on ? "Увімкнути тепловий насос?" : "Вимкнути тепловий насос?");
-    if (!ok) return;
-    return act({action: on ? "switch_on" : "switch_off", entity_id: S.layout.heating.heatpump.switch}, "Тепловий насос");
-  }
-  if (b.dataset.away) {
-    const on = b.dataset.away === "on", id = S.layout.heating.away.switch;
-    const ok = await confirmBox(on
-      ? "Увімкнути режим відсутності? Опалення і гаряча вода перейдуть на мінімум."
-      : "Вимкнути режим відсутності? Опалення повернеться до звичайного режиму.");
-    if (!ok) return;
-    haptic();
-    return act({action: on ? "switch_on" : "switch_off", entity_id: id}, "Режим відсутності");
-  }
+  if (b.dataset.q) return onQuick(b.dataset.q);
   if (b.dataset.dhwmode) {
     haptic();
     return act({action: "set_operation_mode", entity_id: b.dataset.dhwmode, operation_mode: b.dataset.m}, "Гаряча вода");
@@ -504,6 +632,19 @@ $("#app").addEventListener("change", e => {
   const s = e.target.closest("select[data-fan]"); if (!s) return;
   s.blur();
   act({action: "set_fan_mode", entity_id: s.dataset.fan, fan_mode: s.value}, "Вентилятор");
+});
+
+let refreshing = false;
+$("#refresh").addEventListener("click", async () => {
+  if (refreshing) return;
+  refreshing = true; haptic("soft");
+  $("#refresh").classList.add("spin"); $("#foot").textContent = "Оновлюю…";
+  try { await api("/api/tgapp/action", {method: "POST", body: {action: "refresh"}}); }
+  catch (e) { if (e.status === 429) toast("Забагато команд, зачекай хвилину"); }
+  finally {
+    await load();
+    refreshing = false; $("#refresh").classList.remove("spin");
+  }
 });
 
 // ---------- polling ----------
