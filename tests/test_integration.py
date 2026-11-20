@@ -281,3 +281,83 @@ def test_layout_power_validation():
             parse_layout({"ac": [{"climate": AC, "power_w": bad}]})
     with pytest.raises(LayoutError):
         parse_layout({"heating": {"heatpump": "switch.x"}})
+
+
+async def test_unload_and_remove_disable_api(hass, setup, hass_client_no_auth):
+    calls = async_mock_service(hass, "switch", "turn_on")
+    client = await hass_client_no_auth()
+    h = {"X-Telegram-Init-Data": init_data()}
+    assert await hass.config_entries.async_unload(setup.entry_id)
+    await hass.async_block_till_done()
+    assert (await client.get("/tgapp")).status == 404
+    assert (await client.get("/api/tgapp/state", headers=h)).status == 404
+    r = await client.post("/api/tgapp/action", headers=h, json={"action": "switch_on", "entity_id": HP})
+    assert r.status == 404 and not calls
+    # setting it up again brings the endpoints back
+    assert await hass.config_entries.async_setup(setup.entry_id)
+    await hass.async_block_till_done()
+    assert (await client.get("/api/tgapp/state", headers=h)).status == 200
+    await hass.config_entries.async_remove(setup.entry_id)
+    await hass.async_block_till_done()
+    assert (await client.get("/api/tgapp/state", headers=h)).status == 404
+
+
+async def test_non_object_body_is_400(hass, setup, hass_client_no_auth):
+    client = await hass_client_no_auth()
+    h = {"X-Telegram-Init-Data": init_data()}
+    for raw in ("[1,2]", '"x"', "42", "null"):
+        r = await client.post("/api/tgapp/action", headers=h, data=raw)
+        assert r.status == 400, raw
+
+
+async def test_input_boolean_heatpump(hass, hass_client_no_auth, aioclient_mock):
+    aioclient_mock.post(f"https://api.telegram.org/bot{TOKEN}/setChatMenuButton", json={"ok": True})
+    MockConfigEntry(
+        domain="telegram_bot", data={"api_key": TOKEN, "platform": "polling"},
+        subentries_data=[ConfigSubentryData(data={"chat_id": ALLOWED}, subentry_type="allowed_chat_ids",
+                                            title="me", unique_id=str(ALLOWED))],
+    ).add_to_hass(hass)
+    hass.config.components.add("telegram_bot")
+    hass.states.async_set("input_boolean.hp", "off")
+    assert await async_setup_component(hass, "http", {})
+    entry = MockConfigEntry(domain="tg_miniapp", data={}, options={
+        "public_url": "https://app.example.com",
+        "layout": json.dumps({"heating": {"heatpump": {"switch": "input_boolean.hp"}}})})
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    calls = async_mock_service(hass, "input_boolean", "turn_on")
+    client = await hass_client_no_auth()
+    r = await client.post("/api/tgapp/action", headers={"X-Telegram-Init-Data": init_data()},
+                          json={"action": "switch_on", "entity_id": "input_boolean.hp"})
+    assert r.status == 200 and len(calls) == 1
+
+
+async def test_menu_button_failure_does_not_break_setup(hass, aioclient_mock):
+    import asyncio
+    aioclient_mock.post(f"https://api.telegram.org/bot{TOKEN}/setChatMenuButton", exc=asyncio.TimeoutError)
+    MockConfigEntry(domain="telegram_bot", data={"api_key": TOKEN, "platform": "polling"}).add_to_hass(hass)
+    hass.config.components.add("telegram_bot")
+    assert await async_setup_component(hass, "http", {})
+    entry = MockConfigEntry(domain="tg_miniapp", data={}, options={"public_url": "https://app.example.com"})
+    entry.add_to_hass(hass)
+    assert await hass.config_entries.async_setup(entry.entry_id)
+    await hass.async_block_till_done()
+    assert entry.state.value == "loaded"
+
+
+def test_phase_limit_validation():
+    from custom_components.tg_miniapp.const import LayoutError, parse_layout
+    for bad in (0, -5, "4kW"):
+        with pytest.raises(LayoutError):
+            parse_layout({"energy": {"phase_limit_w": bad}})
+
+
+async def test_temperature_step_has_no_float_noise(hass, setup, hass_client_no_auth):
+    calls = async_mock_service(hass, "climate", "set_temperature")
+    hass.states.async_set(ZONE, "heat_cool", {"hvac_modes": ["heat_cool", "off"], "min_temp": 7,
+                                              "max_temp": 35, "target_temp_step": 0.1, "temperature": 22})
+    client = await hass_client_no_auth()
+    r = await client.post("/api/tgapp/action", headers={"X-Telegram-Init-Data": init_data()},
+                          json={"action": "set_temperature", "entity_id": ZONE, "temperature": 22.7})
+    assert r.status == 200 and calls[-1].data["temperature"] == 22.7
