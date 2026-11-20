@@ -19,8 +19,15 @@ API_STATE_URL = "/api/tgapp/state"
 API_ACTION_URL = "/api/tgapp/action"
 
 INIT_DATA_HEADER = "X-Telegram-Init-Data"
+SWITCH_DOMAINS = ("switch.", "input_boolean.")
 INIT_DATA_MAX_AGE = 24 * 3600  # seconds a Mini App session stays valid
 ACTIONS_PER_MINUTE = 30
+
+# Cloud integrations (e.g. myVAILLANT) poll rarely and report a change late.
+# After an action the app shows the requested value as "pending" for up to
+# PENDING_TTL seconds and asks HA to refresh the entity at REFRESH_DELAYS.
+PENDING_TTL = 240
+REFRESH_DELAYS = (15, 60, 150)
 
 # ---------------------------------------------------------------------------
 # Layout: what the Mini App shows. It is stored as JSON in the integration
@@ -85,6 +92,10 @@ EXAMPLE_LAYOUT: dict = {
             "flow": "sensor.heatpump_flow_temperature",
             "power_w": DEFAULT_HEATPUMP_POWER_W,
         },
+        # Domestic hot water (water_heater.*), optional.
+        "dhw": {"water_heater": "water_heater.domestic_hot_water_0"},
+        # Away / holiday mode switch, optional.
+        "away": {"switch": "switch.away_mode"},
     },
     "ac": [
         {"name": "Bedroom", "icon": "🛏", "climate": "climate.bedroom_ac", "power_w": 1000},
@@ -111,12 +122,21 @@ def parse_layout(raw: str | dict | None) -> dict:
     layout.setdefault("ac", [])
     heating.setdefault("zones", [])
     heating.setdefault("heatpump", {})
+    heating.setdefault("dhw", {})
+    heating.setdefault("away", {})
     if not isinstance(energy, dict) or not isinstance(heating, dict):
         raise LayoutError("energy and heating must be objects")
     if not isinstance(layout["ac"], list) or not isinstance(heating["zones"], list):
         raise LayoutError("ac and heating.zones must be lists")
-    if not isinstance(heating["heatpump"], dict):
-        raise LayoutError("heating.heatpump must be an object")
+    for key in ("heatpump", "dhw", "away"):
+        if not isinstance(heating[key], dict):
+            raise LayoutError(f"heating.{key} must be an object")
+    wh = heating["dhw"].get("water_heater")
+    if wh is not None and not str(wh).startswith("water_heater."):
+        raise LayoutError("heating.dhw.water_heater must be a water_heater.* entity")
+    away = heating["away"].get("switch")
+    if away is not None and not str(away).startswith(SWITCH_DOMAINS):
+        raise LayoutError("heating.away.switch must be a switch.* entity")
     for key in ("grid_voltage", "load_phase"):
         energy.setdefault(key, [])
     energy.setdefault("battery_capacity_kwh", 10)
@@ -126,8 +146,10 @@ def parse_layout(raw: str | dict | None) -> dict:
         if not isinstance(item, dict) or not str(item.get("climate", "")).startswith("climate."):
             raise LayoutError("every zone/ac item needs a climate.* entity")
     sw = heating["heatpump"].get("switch")
-    if sw is not None and not str(sw).startswith(("switch.", "input_boolean.")):
+    if sw is not None and not str(sw).startswith(SWITCH_DOMAINS):
         raise LayoutError("heatpump.switch must be a switch.* entity")
+    if not isinstance(energy.get("phase_limit_w"), (int, float)) or energy["phase_limit_w"] <= 0:
+        raise LayoutError("energy.phase_limit_w must be a positive number")
     heating["heatpump"].setdefault("power_w", DEFAULT_HEATPUMP_POWER_W)
     for item in layout["ac"]:
         item.setdefault("power_w", DEFAULT_AC_POWER_W)
@@ -161,8 +183,14 @@ def climate_entities(layout: dict) -> frozenset[str]:
 
 
 def switch_entities(layout: dict) -> frozenset[str]:
-    sw = layout["heating"]["heatpump"].get("switch")
-    return frozenset([sw] if sw and str(sw).startswith("switch.") else [])
+    heating = layout["heating"]
+    found = [heating["heatpump"].get("switch"), heating.get("away", {}).get("switch")]
+    return frozenset(sw for sw in found if sw and str(sw).startswith(SWITCH_DOMAINS))
+
+
+def water_heater_entities(layout: dict) -> frozenset[str]:
+    wh = layout["heating"].get("dhw", {}).get("water_heater")
+    return frozenset([wh] if wh and str(wh).startswith("water_heater.") else [])
 
 
 # Attributes passed to the frontend (everything else is dropped).
@@ -179,4 +207,7 @@ EXPOSED_ATTRS = (
     "fan_mode",
     "fan_modes",
     "preset_mode",
+    "operation_list",
+    "operation_mode",
+    "holiday_end_date_time",
 )

@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import logging
 
+import aiohttp
+
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_API_KEY
 from homeassistant.core import HomeAssistant
@@ -26,6 +28,7 @@ from .const import (
     LayoutError,
     parse_layout,
 )
+from .pending import PendingStore
 from .views import ActionView, PageView, StateView
 
 _LOGGER = logging.getLogger(__name__)
@@ -44,14 +47,26 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         hass.http.register_view(StateView())
         hass.http.register_view(ActionView())
         data["views_registered"] = True  # aiohttp routes cannot be removed
+    data["active"] = True
+    if "pending" not in data:
+        data["pending"] = PendingStore(hass)
 
     entry.async_on_unload(entry.add_update_listener(_async_reload))
-    hass.async_create_task(_async_set_menu_button(hass, entry))
+    # Background task: Telegram may be unreachable (e.g. no internet during a
+    # power outage) and that must not delay Home Assistant startup.
+    entry.async_create_background_task(
+        hass, _async_set_menu_button(hass, entry), "tg_miniapp_menu_button"
+    )
     return True
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Nothing to tear down; the routes stay until restart."""
+    """Switch the endpoints off. aiohttp routes stay, but answer 404."""
+    data = hass.data.get(DOMAIN, {})
+    data["active"] = False
+    pending = data.get("pending")
+    if pending is not None:
+        pending.clear()
     return True
 
 
@@ -79,13 +94,15 @@ async def _async_set_menu_button(hass: HomeAssistant, entry: ConfigEntry) -> Non
             async with session.post(
                 f"https://api.telegram.org/bot{token}/setChatMenuButton",
                 json=payload,
-                timeout=15,
+                timeout=aiohttp.ClientTimeout(total=15),
             ) as resp:
                 body = await resp.json(content_type=None)
         except Exception as err:  # noqa: BLE001 - network errors must not break setup
             _LOGGER.warning("Mini App: could not set menu button: %s", type(err).__name__)
             continue
-        if body.get("ok"):
+        if not isinstance(body, dict):
+            _LOGGER.warning("Mini App: unexpected Telegram reply to setChatMenuButton")
+        elif body.get("ok"):
             _LOGGER.info("Mini App: menu button '%s' -> %s", text, url)
         else:
             _LOGGER.warning("Mini App: Telegram refused menu button: %s", body.get("description"))

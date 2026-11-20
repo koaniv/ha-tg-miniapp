@@ -31,7 +31,9 @@ from .const import (
     climate_entities,
     readable_entities,
     switch_entities,
+    water_heater_entities,
 )
+from .pending import PendingStore, expected_result
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -88,6 +90,11 @@ def _error(code: str, status: int) -> web.Response:
     return web.json_response({"code": code}, status=status, headers=API_HEADERS)
 
 
+def _active(hass: HomeAssistant) -> bool:
+    """False once the config entry is unloaded or removed (routes cannot be)."""
+    return bool(hass.data.get(DOMAIN, {}).get("active"))
+
+
 def authenticate(hass: HomeAssistant, request: web.Request) -> dict | web.Response:
     """Return the Telegram user dict, or a ready error response.
 
@@ -95,6 +102,8 @@ def authenticate(hass: HomeAssistant, request: web.Request) -> dict | web.Respon
     failed login. Expired or missing initData is answered without raising,
     so a family member with an old session is never banned.
     """
+    if not _active(hass):
+        return _error("disabled", 404)
     init_data = request.headers.get(INIT_DATA_HEADER, "")
     if not init_data:
         return _error("no_init_data", 403)
@@ -122,15 +131,24 @@ def _layout(hass: HomeAssistant) -> dict:
     return hass.data[DOMAIN]["layout"]
 
 
+def _pending(hass: HomeAssistant) -> PendingStore:
+    data = hass.data[DOMAIN]
+    if "pending" not in data:
+        data["pending"] = PendingStore(hass)
+    return data["pending"]
+
+
 def _state_dict(hass: HomeAssistant, entity_id: str) -> dict | None:
+    """State for the client. "p": 1 marks a requested value HA has not confirmed yet."""
     st = hass.states.get(entity_id)
     if st is None:
         return None
-    return {
+    out = {
         "s": st.state,
         "a": {k: st.attributes[k] for k in EXPOSED_ATTRS if k in st.attributes},
         "lc": st.last_changed.isoformat(),
     }
+    return _pending(hass).overlay(entity_id, out)
 
 
 class PageView(HomeAssistantView):
@@ -143,6 +161,8 @@ class PageView(HomeAssistantView):
 
     async def get(self, request: web.Request) -> web.Response:
         hass: HomeAssistant = request.app["hass"]
+        if not _active(hass):
+            return web.Response(status=404)
         html = await hass.async_add_executor_job(
             (WWW / "index.html").read_text, "utf-8"
         )
@@ -205,6 +225,8 @@ class ActionView(HomeAssistantView):
             body: dict[str, Any] = await request.json()
         except ValueError:
             return self.json_message("bad json", 400, headers=API_HEADERS)
+        if not isinstance(body, dict):
+            return self.json_message("bad json", 400, headers=API_HEADERS)
 
         try:
             domain, service, data = _build_call(hass, body)
@@ -223,6 +245,7 @@ class ActionView(HomeAssistantView):
             # Details go to the log, not to the client.
             _LOGGER.warning("Mini App: %s.%s failed: %s", domain, service, err)
             return self.json_message("action failed", 502, headers=API_HEADERS)
+        _pending(hass).add(data["entity_id"], *expected_result(domain, service, data))
         return self.json(
             {"ok": True, "state": _state_dict(hass, data["entity_id"])},
             headers=API_HEADERS,
@@ -243,24 +266,29 @@ def _build_call(hass: HomeAssistant, body: dict) -> tuple[str, str, dict]:
     if action in ("switch_on", "switch_off"):
         if entity_id not in switch_entities(layout):
             raise ValueError("entity not allowed")
-        return "switch", "turn_on" if action == "switch_on" else "turn_off", {
+        domain = entity_id.split(".", 1)[0]  # switch or input_boolean
+        return domain, "turn_on" if action == "switch_on" else "turn_off", {
             "entity_id": entity_id
         }
+
+    if entity_id in water_heater_entities(layout):
+        if action == "set_temperature":
+            temp = _clamp_temperature(st, body.get("temperature"), default_step=1.0)
+            return "water_heater", "set_temperature", {"entity_id": entity_id, "temperature": temp}
+        if action == "set_operation_mode":
+            mode = body.get("operation_mode")
+            if mode not in (st.attributes.get("operation_list") or []):
+                raise ValueError("mode not supported")
+            return "water_heater", "set_operation_mode", {
+                "entity_id": entity_id, "operation_mode": mode
+            }
+        raise ValueError("unknown action")
 
     if entity_id not in climate_entities(layout):
         raise ValueError("entity not allowed")
 
     if action == "set_temperature":
-        try:
-            temp = float(body.get("temperature"))
-        except (TypeError, ValueError) as err:
-            raise ValueError("temperature required") from err
-        if not math.isfinite(temp):
-            raise ValueError("bad temperature")
-        lo = float(st.attributes.get("min_temp", 7))
-        hi = float(st.attributes.get("max_temp", 35))
-        step = float(st.attributes.get("target_temp_step") or 0.5)
-        temp = min(max(round(temp / step) * step, lo), hi)
+        temp = _clamp_temperature(st, body.get("temperature"), default_step=0.5)
         return "climate", "set_temperature", {"entity_id": entity_id, "temperature": temp}
 
     if action == "set_hvac_mode":
@@ -276,3 +304,20 @@ def _build_call(hass: HomeAssistant, body: dict) -> tuple[str, str, dict]:
         return "climate", "set_fan_mode", {"entity_id": entity_id, "fan_mode": mode}
 
     raise ValueError("unknown action")
+
+
+def _clamp_temperature(st, value, default_step: float) -> float:
+    """Round to the entity's step and clamp to its own min/max."""
+    try:
+        temp = float(value)
+    except (TypeError, ValueError) as err:
+        raise ValueError("temperature required") from err
+    if not math.isfinite(temp):
+        raise ValueError("bad temperature")
+    try:
+        lo = float(st.attributes.get("min_temp", 7))
+        hi = float(st.attributes.get("max_temp", 35))
+        step = float(st.attributes.get("target_temp_step") or default_step)
+    except (TypeError, ValueError) as err:
+        raise ValueError("entity has no temperature limits") from err
+    return round(min(max(round(temp / step) * step, lo), hi), 2)
