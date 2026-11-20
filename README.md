@@ -3,7 +3,9 @@
 A small Telegram Mini App served by Home Assistant itself, so no extra server is needed. It opens from your Telegram bot's menu button and shows three screens:
 
 - **Energy**: grid status and outage duration, battery SOC and time left, PV, load per phase, today's totals (Deye / Sunsynk sensors).
-- **Heating**: away mode on/off, heating zones (current/target temperature, Off / Manual / Schedule), domestic hot water (temperature and operation mode), system pressure, flow and outdoor temperature, heat-pump on/off.
+- **Heating**: outdoor temperature, pressure, flow and hot-water temperature; quick toggles for away mode (until cancelled or 1/3/7 days), all heating zones (back to each zone's last mode, otherwise Schedule) and the heat pump; heating zones (current/target temperature, Off / Manual / Schedule), domestic hot water (temperature and operation mode), heat-pump heating and hot-water temperatures.
+
+While away mode is on, the heating zones and hot water cannot be changed (the API answers 409). When away mode ends, whoever turned it off, the zones and hot water are re-read from the cloud and shown as syncing for a few seconds. The ↻ button next to the tabs asks HA to poll every entity of the layout (at most once per 20 seconds, to respect cloud API quotas).
 - **AC**: power, mode, target temperature and fan speed for each air conditioner.
 
 During a grid outage the Heating and AC screens show a "no grid" banner with the battery level. Before turning on the heat pump or an air conditioner, the app shows how much load it adds, the current battery level and roughly how long the battery will last. Set each device's draw with `"power_w"` in the layout (defaults: heat pump 2000 W, AC 1000 W).
@@ -14,6 +16,8 @@ Hot water and away mode are optional parts of `heating` in the layout:
 "dhw": {"water_heater": "water_heater.xata_domestic_hot_water_0"},
 "away": {"switch": "switch.xata_away_mode"}
 ```
+
+Heat-pump temperatures shown on its card: `"temp_heating"` and `"temp_dhw"` in `heating.heatpump` (fallback: `flow` and `temperature`). Away mode for a number of days uses `mypyllant.set_holiday`; "until cancelled" turns the away switch on.
 
 Cloud integrations such as myVAILLANT poll the cloud rarely, so HA reports a change late. After a command the app shows the requested value with "⏳ застосовується" and asks HA to refresh the entity after 15, 60 and 150 seconds. If HA has not confirmed the change within 4 minutes, the app shows the real state again.
 
