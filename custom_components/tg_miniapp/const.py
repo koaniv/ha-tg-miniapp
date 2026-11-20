@@ -28,6 +28,12 @@ ACTIONS_PER_MINUTE = 30
 # PENDING_TTL seconds and asks HA to refresh the entity at REFRESH_DELAYS.
 PENDING_TTL = 240
 REFRESH_DELAYS = (15, 60, 150)
+# After away mode ends, the zones and hot water are re-read from the cloud and
+# shown as "syncing" (locked) for up to SYNC_SECONDS.
+SYNC_SECONDS = 30
+# "Refresh all" asks every integration to poll; cloud APIs have quotas.
+REFRESH_COOLDOWN = 20
+HOLIDAY_MAX_DAYS = 30
 
 # ---------------------------------------------------------------------------
 # Layout: what the Mini App shows. It is stored as JSON in the integration
@@ -91,6 +97,9 @@ EXAMPLE_LAYOUT: dict = {
             "temperature": "sensor.heatpump_temperature",
             "flow": "sensor.heatpump_flow_temperature",
             "power_w": DEFAULT_HEATPUMP_POWER_W,
+            # optional: shown as "heating" / "hot water" temperatures
+            "temp_heating": "sensor.heatpump_flow_temperature",
+            "temp_dhw": "sensor.heatpump_temperature",
         },
         # Domestic hot water (water_heater.*), optional.
         "dhw": {"water_heater": "water_heater.domestic_hot_water_0"},
@@ -186,6 +195,16 @@ def switch_entities(layout: dict) -> frozenset[str]:
     heating = layout["heating"]
     found = [heating["heatpump"].get("switch"), heating.get("away", {}).get("switch")]
     return frozenset(sw for sw in found if sw and str(sw).startswith(SWITCH_DOMAINS))
+
+
+def zone_entities(layout: dict) -> frozenset[str]:
+    """Heating-zone climates (locked while away mode is on); ACs are not included."""
+    return frozenset(z["climate"] for z in layout["heating"]["zones"])
+
+
+def away_switch(layout: dict) -> str | None:
+    sw = layout["heating"].get("away", {}).get("switch")
+    return sw if sw and str(sw).startswith(SWITCH_DOMAINS) else None
 
 
 def water_heater_entities(layout: dict) -> frozenset[str]:

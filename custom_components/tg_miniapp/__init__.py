@@ -14,8 +14,9 @@ import aiohttp
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_API_KEY
-from homeassistant.core import HomeAssistant
+from homeassistant.core import Event, EventStateChangedData, HomeAssistant, callback
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
+from homeassistant.helpers.event import async_track_state_change_event
 
 from .const import (
     CONF_LAYOUT,
@@ -26,9 +27,12 @@ from .const import (
     PAGE_URL,
     TELEGRAM_DOMAIN,
     LayoutError,
+    away_switch,
     parse_layout,
+    water_heater_entities,
+    zone_entities,
 )
-from .pending import PendingStore
+from .pending import PendingStore, start_sync
 from .views import ActionView, PageView, StateView
 
 _LOGGER = logging.getLogger(__name__)
@@ -52,6 +56,18 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         data["pending"] = PendingStore(hass)
 
     entry.async_on_unload(entry.add_update_listener(_async_reload))
+
+    layout = data["layout"]
+    if away := away_switch(layout):
+        vaillant = zone_entities(layout) | water_heater_entities(layout)
+
+        @callback
+        def _away_changed(event: Event[EventStateChangedData]) -> None:
+            old, new = event.data["old_state"], event.data["new_state"]
+            if old is not None and new is not None and old.state == "on" and new.state == "off":
+                start_sync(hass, vaillant)
+
+        entry.async_on_unload(async_track_state_change_event(hass, [away], _away_changed))
     # Background task: Telegram may be unreachable (e.g. no internet during a
     # power outage) and that must not delay Home Assistant startup.
     entry.async_create_background_task(
@@ -67,6 +83,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     pending = data.get("pending")
     if pending is not None:
         pending.clear()
+    for unsub in data.pop("unsubs", []):
+        unsub()
+    data.pop("sync_until", None)
     return True
 
 

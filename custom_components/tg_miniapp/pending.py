@@ -10,13 +10,15 @@ and ask HA to refresh the entity a few times in between.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import math
 import time
 
 from homeassistant.core import HassJob, HomeAssistant, callback
 from homeassistant.helpers.event import async_call_later
 
-from .const import PENDING_TTL, REFRESH_DELAYS
+from .const import DOMAIN, PENDING_TTL, REFRESH_DELAYS, SYNC_SECONDS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -120,3 +122,42 @@ class PendingStore:
         except Exception as err:  # noqa: BLE001 - a failed refresh is not fatal
             _LOGGER.debug("Mini App: refresh of %s failed: %s", entity_id, err)
 
+
+
+async def async_update_entities(
+    hass: HomeAssistant, entity_ids, timeout: float | None = None
+) -> bool:
+    """Ask HA to poll the given entities now (homeassistant.update_entity)."""
+    ids = sorted(e for e in entity_ids if hass.states.get(e) is not None)
+    if not ids or not hass.services.has_service("homeassistant", "update_entity"):
+        return False
+    try:
+        async with asyncio.timeout(timeout):
+            await hass.services.async_call(
+                "homeassistant", "update_entity", {"entity_id": ids}, blocking=True
+            )
+    except Exception as err:  # noqa: BLE001 - a failed refresh is not fatal
+        _LOGGER.debug("Mini App: refresh failed: %s", err)
+        return False
+    return True
+
+
+def start_sync(hass: HomeAssistant, entity_ids) -> None:
+    """Away mode ended: re-read the zones and hot water, show them as syncing."""
+    data = hass.data[DOMAIN]
+    data["sync_until"] = time.monotonic() + SYNC_SECONDS
+    ids = list(entity_ids)
+    hass.async_create_task(async_update_entities(hass, ids), eager_start=True)
+
+    @callback
+    def _again(_now) -> None:
+        hass.async_create_task(async_update_entities(hass, ids), eager_start=True)
+
+    data.setdefault("unsubs", []).append(
+        async_call_later(hass, SYNC_SECONDS // 2, HassJob(_again, cancel_on_shutdown=True))
+    )
+
+
+def sync_remaining(hass: HomeAssistant) -> int:
+    left = hass.data.get(DOMAIN, {}).get("sync_until", 0) - time.monotonic()
+    return max(0, math.ceil(left))

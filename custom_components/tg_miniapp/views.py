@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict, deque
+from dataclasses import dataclass, field
 import logging
 import math
 from pathlib import Path
@@ -25,15 +26,24 @@ from .const import (
     DOMAIN,
     EXPOSED_ATTRS,
     INIT_DATA_HEADER,
+    HOLIDAY_MAX_DAYS,
     INIT_DATA_MAX_AGE,
     PAGE_URL,
+    REFRESH_COOLDOWN,
     TELEGRAM_DOMAIN,
+    away_switch,
     climate_entities,
     readable_entities,
     switch_entities,
     water_heater_entities,
+    zone_entities,
 )
-from .pending import PendingStore, expected_result
+from .pending import (
+    PendingStore,
+    async_update_entities,
+    expected_result,
+    sync_remaining,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -143,12 +153,29 @@ def _state_dict(hass: HomeAssistant, entity_id: str) -> dict | None:
     st = hass.states.get(entity_id)
     if st is None:
         return None
+    if entity_id in zone_entities(_layout(hass)):
+        _remember_mode(hass, entity_id, st.state, st.attributes.get("hvac_modes") or [])
     out = {
         "s": st.state,
         "a": {k: st.attributes[k] for k in EXPOSED_ATTRS if k in st.attributes},
         "lc": st.last_changed.isoformat(),
     }
     return _pending(hass).overlay(entity_id, out)
+
+
+def _remember_mode(hass: HomeAssistant, entity_id: str, mode: str, modes: list) -> None:
+    if mode != "off" and mode in modes:
+        hass.data[DOMAIN].setdefault("last_mode", {})[entity_id] = mode
+
+
+def _resume_mode(hass: HomeAssistant, entity_id: str, modes: list) -> str | None:
+    """Mode to turn a zone back on with: its last one, else schedule (auto)."""
+    last = hass.data[DOMAIN].get("last_mode", {}).get(entity_id)
+    if last in modes:
+        return last
+    if "auto" in modes:
+        return "auto"
+    return next((m for m in modes if m != "off"), None)
 
 
 class PageView(HomeAssistantView):
@@ -188,6 +215,7 @@ class StateView(HomeAssistantView):
                 "user": {"id": user["id"], "first_name": user.get("first_name", "")},
                 "layout": (layout := _layout(hass)),
                 "states": {e: _state_dict(hass, e) for e in sorted(readable_entities(layout))},
+                "sync": sync_remaining(hass),
                 "ts": time.time(),
             },
             headers=API_HEADERS,
@@ -228,34 +256,121 @@ class ActionView(HomeAssistantView):
         if not isinstance(body, dict):
             return self.json_message("bad json", 400, headers=API_HEADERS)
 
+        if body.get("action") == "refresh":
+            return await self._refresh(hass)
+
         try:
-            domain, service, data = _build_call(hass, body)
+            plan = _build_plan(hass, body)
+        except Locked as err:
+            return self.json({"code": err.code, "message": str(err)}, 409, headers=API_HEADERS)
         except ValueError as err:
             return self.json_message(str(err), 400, headers=API_HEADERS)
 
-        _LOGGER.info(
-            "Mini App: %s (%s) -> %s.%s %s",
-            user.get("first_name"), user["id"], domain, service, data,
-        )
-        try:
-            await hass.services.async_call(
-                domain, service, data, blocking=True, context=None
+        for domain, service, data in plan.calls:
+            _LOGGER.info(
+                "Mini App: %s (%s) -> %s.%s %s",
+                user.get("first_name"), user["id"], domain, service, data,
             )
-        except (HomeAssistantError, ValueError) as err:
-            # Details go to the log, not to the client.
-            _LOGGER.warning("Mini App: %s.%s failed: %s", domain, service, err)
-            return self.json_message("action failed", 502, headers=API_HEADERS)
-        _pending(hass).add(data["entity_id"], *expected_result(domain, service, data))
+            try:
+                await hass.services.async_call(domain, service, data, blocking=True, context=None)
+            except (HomeAssistantError, ValueError) as err:
+                # Details go to the log, not to the client.
+                _LOGGER.warning("Mini App: %s.%s failed: %s", domain, service, err)
+                return self.json_message("action failed", 502, headers=API_HEADERS)
+        pending = _pending(hass)
+        for entity_id, state, attrs in plan.expect:
+            pending.add(entity_id, state, attrs)
+        states = {e: _state_dict(hass, e) for e, _, _ in plan.expect}
         return self.json(
-            {"ok": True, "state": _state_dict(hass, data["entity_id"])},
+            {"ok": True, "state": next(iter(states.values()), None), "states": states},
             headers=API_HEADERS,
         )
 
+    async def _refresh(self, hass: HomeAssistant) -> web.Response:
+        """Poll every entity of the layout now (at most once per REFRESH_COOLDOWN)."""
+        data = hass.data[DOMAIN]
+        now = time.monotonic()
+        if now - data.get("last_refresh", -REFRESH_COOLDOWN) < REFRESH_COOLDOWN:
+            return self.json({"ok": True, "skipped": True}, headers=API_HEADERS)
+        data["last_refresh"] = now
+        await async_update_entities(hass, readable_entities(_layout(hass)), timeout=20)
+        return self.json({"ok": True}, headers=API_HEADERS)
 
-def _build_call(hass: HomeAssistant, body: dict) -> tuple[str, str, dict]:
-    """Validate a request body against the whitelist and build a service call."""
+
+class Locked(ValueError):
+    """The action is not allowed in the current mode (e.g. away mode is on)."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+@dataclass
+class Plan:
+    """Service calls for one action and what HA should report afterwards."""
+
+    calls: list[tuple[str, str, dict]] = field(default_factory=list)
+    expect: list[tuple[str, str | None, dict]] = field(default_factory=list)
+
+    def add(self, domain: str, service: str, data: dict) -> Plan:
+        self.calls.append((domain, service, data))
+        self.expect.append((data["entity_id"], *expected_result(domain, service, data)))
+        return self
+
+
+def _away_on(hass: HomeAssistant, layout: dict) -> bool:
+    sw = away_switch(layout)
+    st = hass.states.get(sw) if sw else None
+    return st is not None and st.state == "on"
+
+
+def _check_unlocked(hass: HomeAssistant, layout: dict) -> None:
+    if _away_on(hass, layout):
+        raise Locked("away_mode", "away mode is on")
+    if sync_remaining(hass):
+        raise Locked("syncing", "heating state is being refreshed")
+
+
+def _build_plan(hass: HomeAssistant, body: dict) -> Plan:
+    """Validate a request body against the whitelist and build the service calls."""
     layout = _layout(hass)
     action = body.get("action")
+
+    if action in ("zones_on", "zones_off"):
+        _check_unlocked(hass, layout)
+        plan = Plan()
+        for entity_id in sorted(zone_entities(layout)):
+            st = hass.states.get(entity_id)
+            if st is None:
+                continue
+            modes = st.attributes.get("hvac_modes") or []
+            if action == "zones_off" and st.state != "off" and "off" in modes:
+                _remember_mode(hass, entity_id, st.state, modes)
+                plan.add("climate", "set_hvac_mode", {"entity_id": entity_id, "hvac_mode": "off"})
+            elif action == "zones_on" and st.state == "off":
+                if mode := _resume_mode(hass, entity_id, modes):
+                    plan.add("climate", "set_hvac_mode", {"entity_id": entity_id, "hvac_mode": mode})
+        if not plan.calls:
+            raise ValueError("nothing to change")
+        return plan
+
+    if action == "away_on":
+        sw = away_switch(layout)
+        if not sw or hass.states.get(sw) is None:
+            raise ValueError("no away switch")
+        days = body.get("days")
+        if days is None:  # until cancelled
+            return Plan().add(sw.split(".", 1)[0], "turn_on", {"entity_id": sw})
+        if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= HOLIDAY_MAX_DAYS:
+            raise ValueError("bad days")
+        target = next(iter(sorted(zone_entities(layout))), None)
+        if target is None or not hass.services.has_service("mypyllant", "set_holiday"):
+            raise ValueError("holiday duration not supported")
+        plan = Plan()
+        plan.calls.append(("mypyllant", "set_holiday", {"entity_id": target, "duration_hours": days * 24}))
+        plan.expect.append((sw, "on", {}))
+        return plan
+
     entity_id = body.get("entity_id")
     if not isinstance(entity_id, str):
         raise ValueError("entity_id required")
@@ -267,41 +382,48 @@ def _build_call(hass: HomeAssistant, body: dict) -> tuple[str, str, dict]:
         if entity_id not in switch_entities(layout):
             raise ValueError("entity not allowed")
         domain = entity_id.split(".", 1)[0]  # switch or input_boolean
-        return domain, "turn_on" if action == "switch_on" else "turn_off", {
-            "entity_id": entity_id
-        }
+        return Plan().add(domain, "turn_on" if action == "switch_on" else "turn_off",
+                          {"entity_id": entity_id})
 
     if entity_id in water_heater_entities(layout):
         if action == "set_temperature":
+            _check_unlocked(hass, layout)
             temp = _clamp_temperature(st, body.get("temperature"), default_step=1.0)
-            return "water_heater", "set_temperature", {"entity_id": entity_id, "temperature": temp}
+            return Plan().add("water_heater", "set_temperature",
+                              {"entity_id": entity_id, "temperature": temp})
         if action == "set_operation_mode":
             mode = body.get("operation_mode")
             if mode not in (st.attributes.get("operation_list") or []):
                 raise ValueError("mode not supported")
-            return "water_heater", "set_operation_mode", {
-                "entity_id": entity_id, "operation_mode": mode
-            }
+            _check_unlocked(hass, layout)
+            return Plan().add("water_heater", "set_operation_mode",
+                              {"entity_id": entity_id, "operation_mode": mode})
         raise ValueError("unknown action")
 
     if entity_id not in climate_entities(layout):
         raise ValueError("entity not allowed")
+    if entity_id in zone_entities(layout) and action in (
+        "set_temperature", "set_hvac_mode", "set_fan_mode"
+    ):
+        _check_unlocked(hass, layout)
 
     if action == "set_temperature":
         temp = _clamp_temperature(st, body.get("temperature"), default_step=0.5)
-        return "climate", "set_temperature", {"entity_id": entity_id, "temperature": temp}
+        return Plan().add("climate", "set_temperature", {"entity_id": entity_id, "temperature": temp})
 
     if action == "set_hvac_mode":
         mode = body.get("hvac_mode")
         if mode not in (st.attributes.get("hvac_modes") or []):
             raise ValueError("mode not supported")
-        return "climate", "set_hvac_mode", {"entity_id": entity_id, "hvac_mode": mode}
+        if entity_id in zone_entities(layout):
+            _remember_mode(hass, entity_id, st.state, st.attributes.get("hvac_modes") or [])
+        return Plan().add("climate", "set_hvac_mode", {"entity_id": entity_id, "hvac_mode": mode})
 
     if action == "set_fan_mode":
         mode = body.get("fan_mode")
         if mode not in (st.attributes.get("fan_modes") or []):
             raise ValueError("fan mode not supported")
-        return "climate", "set_fan_mode", {"entity_id": entity_id, "fan_mode": mode}
+        return Plan().add("climate", "set_fan_mode", {"entity_id": entity_id, "fan_mode": mode})
 
     raise ValueError("unknown action")
 
