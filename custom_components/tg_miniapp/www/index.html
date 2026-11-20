@@ -35,7 +35,7 @@ body{padding:0 12px calc(16px + env(safe-area-inset-bottom))}
 .small{font-size:13px}
 .big{font-size:34px;font-weight:700;line-height:1.1;font-variant-numeric:tabular-nums}
 .mid{font-size:20px;font-weight:650;font-variant-numeric:tabular-nums}
-.title{font-weight:650;font-size:16px}
+.title{font-weight:650;font-size:16px;white-space:nowrap}
 .stat{background:var(--soft);border-radius:10px;padding:8px 10px}
 .stat b{display:block;font-size:17px;font-variant-numeric:tabular-nums}
 .stat span{font-size:12px;color:var(--hint)}
@@ -67,6 +67,8 @@ select{font:inherit;border:0;border-radius:10px;padding:8px;background:var(--sof
 .banner{display:flex;align-items:center;gap:8px;border-radius:12px;padding:10px 12px;margin:0 0 10px;
   background:color-mix(in srgb,var(--bad) 14%,var(--card));color:var(--text);font-size:14px}
 .banner b{color:var(--bad)}
+.wait{display:inline-block;animation:blink 1.4s ease-in-out infinite}
+@keyframes blink{50%{opacity:.35}}
 </style>
 </head>
 <body>
@@ -89,7 +91,7 @@ let busy = {};           // entity_id -> true while an action is in flight
 let pendingTemp = {};    // entity_id -> {value, timer}
 let lastOk = 0;
 
-try { const t = localStorage.getItem("tgapp.tab"); if (t) tab = t; } catch (e) {}
+try { const t = localStorage.getItem("tgapp.tab"); if (["energy", "heating", "ac"].includes(t)) tab = t; } catch (e) {}
 
 if (tg) { tg.ready(); tg.expand(); try { tg.disableVerticalSwipes && tg.disableVerticalSwipes(); } catch (e) {} }
 
@@ -123,6 +125,14 @@ function since(iso) {
 function hhmm(iso) {
   const d = new Date(String(iso).replace(" ", "T"));
   return isNaN(d) ? "" : d.toLocaleTimeString("uk-UA", {hour: "2-digit", minute: "2-digit"});
+}
+
+// Requested value that HA has not confirmed yet (cloud devices report late).
+const isPending = (id) => { const x = st(id); return !!(x && x.p); };
+const pendPill = (id) => isPending(id) ? `<span class="pill p-warn wait" title="Команду надіслано, чекаємо підтвердження">⏳ застосовується</span> ` : "";
+function dateTime(iso) {
+  const d = new Date(iso);
+  return isNaN(d) ? "" : d.toLocaleString("uk-UA", {day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit"});
 }
 
 // ---------- outage ----------
@@ -214,7 +224,7 @@ async function act(body, label) {
 }
 
 function bumpTemp(id, delta, label) {
-  const step = Number(attr(id, "target_temp_step")) || 0.5;
+  const step = Number(attr(id, "target_temp_step")) || (id.startsWith("water_heater.") ? 1 : 0.5);
   const lo = Number(attr(id, "min_temp")) || 7, hi = Number(attr(id, "max_temp")) || 35;
   const p = pendingTemp[id];
   const cur = p ? p.value : Number(attr(id, "temperature"));
@@ -250,10 +260,12 @@ function viewEnergy() {
       if (kwh > 0) { const h = kwh * 1000 / bp; left = `≈ ${h >= 1 ? fmt(h, 1) + " год" : Math.round(h * 60) + " хв"} до ${E.battery_min_soc}%`; }
     }
   } else if (bp != null && bp < -30) bLabel = "заряд " + fmtW(-bp);
-  const socColor = soc == null ? "var(--hint)" : soc < 30 ? "var(--bad)" : soc < 50 ? "var(--warn)" : "var(--ok)";
+  const minSoc = Number(E.battery_min_soc) || 0;
+  const socColor = soc == null ? "var(--hint)" : soc < minSoc + 10 ? "var(--bad)" : soc < minSoc + 30 ? "var(--warn)" : "var(--ok)";
   const volts = E.grid_voltage.map(num);
   const phases = E.load_phase.map((id, i) => {
-    const w = num(id); const pct = w == null ? 0 : Math.min(100, w / E.phase_limit_w * 100);
+    const w = num(id); const lim = Number(E.phase_limit_w) || 0;
+    const pct = w == null || lim <= 0 ? 0 : Math.max(0, Math.min(100, w / lim * 100));
     const c = pct > 85 ? "var(--bad)" : pct > 60 ? "var(--warn)" : "var(--ok)";
     return `<div class="phase"><span class="muted small">L${i + 1}</span><div class="bar"><i style="width:${pct}%;background:${c}"></i></div><span class="small" style="text-align:right">${fmtW(w)}</span></div>`;
   }).join("");
@@ -301,7 +313,7 @@ function viewHeating() {
     const action = attr(id, "hvac_action");
     return `<div class="card ${b ? "pending" : ""}">
       <div class="row between"><div class="title">${esc(z.icon)} ${esc(z.name)}</div>
-        <div>${special && special !== "None" && special !== "NONE" ? `<span class="pill p-warn">${esc(special)}</span> ` : ""}${action === "heating" ? `<span class="pill p-heat">гріє</span>` : ""}</div></div>
+        <div>${pendPill(id)}${special && special !== "None" && special !== "NONE" ? `<span class="pill p-warn">${esc(special)}</span> ` : ""}${action === "heating" && !isPending(id) ? `<span class="pill p-heat">гріє</span>` : ""}</div></div>
       <div class="row between" style="margin-top:8px">
         <div><div class="big">${fmt(attr(id, "current_temperature"), 1)}°</div><div class="muted small">вологість ${fmt(num(z.humidity))}%</div></div>
         <div class="temp-ctl">
@@ -314,21 +326,62 @@ function viewHeating() {
     </div>`;
   }).join("");
   const hp = H.heatpump, hpOn = val(hp.switch) === "on", hb = !!busy[hp.switch];
-  return outageBanner() + `
+  return outageBanner() + awayCard(H.away || {}) + `
   <div class="card grid2" style="grid-template-columns:1fr 1fr 1fr">
     <div class="stat"><span>🌡 Надворі</span><b>${fmt(num(H.outdoor), 1)}°</b></div>
     <div class="stat"><span>💧 Тиск</span><b style="color:${prColor}">${fmt(pr, 1)} бар</b></div>
     <div class="stat"><span>↗️ Подача</span><b>${fmt(num(H.flow), 1)}°</b></div>
   </div>
   ${zones}
+  ${dhwCard(H.dhw || {})}
   <div class="card ${hb ? "pending" : ""}">
     <div class="row between"><div class="title">♨️ Тепловий насос</div>
-      <span class="pill ${hpOn ? "p-heat" : "p-off"}">${hpOn ? "увімкнено" : "вимкнено"}</span></div>
+      <span>${pendPill(hp.switch)}<span class="pill ${hpOn ? "p-heat" : "p-off"}">${hpOn ? "увімкнено" : "вимкнено"}</span></span></div>
     <div class="grid2" style="margin-top:10px">
       <div class="stat"><span>Температура</span><b>${fmt(num(hp.temperature), 1)}°</b></div>
       <div class="stat"><span>Подача</span><b>${fmt(num(hp.flow), 1)}°</b></div>
     </div>
     <div class="seg"><button class="btn ${hpOn ? "" : "primary"}" data-hp="${hpOn ? "off" : "on"}" ${hb || !st(hp.switch) ? "disabled" : ""}>${hpOn ? "Вимкнути" : "Увімкнути"}</button></div>
+  </div>`;
+}
+
+function awayCard(A) {
+  const id = A.switch; if (!id) return "";
+  const x = st(id);
+  if (!x) return `<div class="card muted">🧳 Режим відсутності: немає даних</div>`;
+  const on = x.s === "on", b = !!busy[id], end = x.a.holiday_end_date_time;
+  const sub = on ? (end && !isPending(id) ? "до " + esc(dateTime(end)) : "увімкнено") : "вимкнено";
+  return `<div class="card ${b ? "pending" : ""}">
+    <div class="row between">
+      <div><div class="title">🧳 Режим відсутності</div><div class="muted small">${pendPill(id)}${sub}</div></div>
+      <button class="btn ${on ? "primary" : ""}" data-away="${on ? "off" : "on"}" ${b ? "disabled" : ""}>${on ? "Вимкнути" : "Увімкнути"}</button>
+    </div></div>`;
+}
+
+const DHW_MODES = {"Manual": "Ручний", "Time Controlled": "Розклад", "Off": "Вимк", "Cylinder Boost": "Буст"};
+const dhwName = (m) => DHW_MODES[m] || m;
+
+function dhwCard(D) {
+  const id = D.water_heater; if (!id) return "";
+  const x = st(id);
+  if (!x) return `<div class="card muted">🚿 Гаряча вода: немає даних</div>`;
+  const mode = x.a.operation_mode || x.s, off = mode === "Off" || mode === "off", b = !!busy[id];
+  const p = pendingTemp[id];
+  const target = p ? p.value : x.a.temperature;
+  const modes = x.a.operation_list || [];
+  const cls = off ? "p-off" : mode === "Cylinder Boost" ? "p-heat" : "p-ok";
+  return `<div class="card ${b ? "pending" : ""}">
+    <div class="row between"><div class="title">🚿 Гаряча вода</div>
+      ${isPending(id) ? pendPill(id) : `<span class="pill ${cls}">${esc(dhwName(mode))}</span>`}</div>
+    <div class="row between" style="margin-top:8px">
+      <div><div class="big">${fmt(x.a.current_temperature, 1)}°</div><div class="muted small">в бойлері</div></div>
+      <div class="temp-ctl">
+        <button class="btn" data-temp="${id}" data-d="-1" ${off || b ? "disabled" : ""}>−</button>
+        <div class="val ${p ? "pending" : ""}">${off ? "—" : fmt(target, 0) + "°"}</div>
+        <button class="btn" data-temp="${id}" data-d="1" ${off || b ? "disabled" : ""}>+</button>
+      </div></div>
+    <div class="seg">${modes.map(m =>
+      `<button class="btn ${mode === m ? "on" : ""}" data-dhwmode="${id}" data-m="${esc(m)}" ${b ? "disabled" : ""}>${esc(dhwName(m))}</button>`).join("")}</div>
   </div>`;
 }
 
@@ -356,12 +409,12 @@ function viewAc() {
     const fans = x.a.fan_modes || [];
     return `<div class="card ${b ? "pending" : ""}">
       <div class="row between"><div class="title">${esc(a.icon)} ${esc(a.name)}</div>
-        <span class="pill ${cls}">${esc(AC_MODE_NAME[mode] || mode)}</span></div>
+        ${isPending(id) ? pendPill(id) : `<span class="pill ${cls}">${esc(AC_MODE_NAME[mode] || mode)}</span>`}</div>
       <div class="row between" style="margin-top:8px">
         <div><div class="big">${fmt(x.a.current_temperature, 0)}°</div><div class="muted small">в кімнаті</div></div>
         <div class="temp-ctl">
           <button class="btn" data-temp="${id}" data-d="-1" ${off || b ? "disabled" : ""}>−</button>
-          <div class="val ${p ? "pending" : ""}">${off ? "—" : fmt(target, 0) + "°"}</div>
+          <div class="val ${p ? "pending" : ""}">${off ? "—" : fmt(target, (Number(x.a.target_temp_step) || 1) < 1 ? 1 : 0) + "°"}</div>
           <button class="btn" data-temp="${id}" data-d="1" ${off || b ? "disabled" : ""}>+</button>
         </div></div>
       <div class="seg">
@@ -375,9 +428,13 @@ function viewAc() {
   }).join("");
 }
 
+let deferred = false;     // a re-render was skipped while a <select> was open
 function render() {
   document.querySelectorAll(".tab").forEach(b => b.classList.toggle("on", b.dataset.tab === tab));
   if (!S) return;
+  const a = document.activeElement;
+  if (a && a.tagName === "SELECT" && $("#app").contains(a)) { deferred = true; return; }
+  deferred = false;
   const v = tab === "heating" ? viewHeating() : tab === "ac" ? viewAc() : viewEnergy();
   $("#app").innerHTML = v;
 }
@@ -405,6 +462,19 @@ $("#app").addEventListener("click", async e => {
     if (!ok) return;
     return act({action: on ? "switch_on" : "switch_off", entity_id: S.layout.heating.heatpump.switch}, "Тепловий насос");
   }
+  if (b.dataset.away) {
+    const on = b.dataset.away === "on", id = S.layout.heating.away.switch;
+    const ok = await confirmBox(on
+      ? "Увімкнути режим відсутності? Опалення і гаряча вода перейдуть на мінімум."
+      : "Вимкнути режим відсутності? Опалення повернеться до звичайного режиму.");
+    if (!ok) return;
+    haptic();
+    return act({action: on ? "switch_on" : "switch_off", entity_id: id}, "Режим відсутності");
+  }
+  if (b.dataset.dhwmode) {
+    haptic();
+    return act({action: "set_operation_mode", entity_id: b.dataset.dhwmode, operation_mode: b.dataset.m}, "Гаряча вода");
+  }
   if (b.dataset.power) {
     const id = b.dataset.power, x = st(id); haptic();
     if (x.s === "off") {
@@ -426,8 +496,13 @@ $("#app").addEventListener("click", async e => {
   }
 });
 
+$("#app").addEventListener("focusout", e => {
+  if (e.target.tagName === "SELECT" && deferred) setTimeout(render, 0);
+});
+
 $("#app").addEventListener("change", e => {
   const s = e.target.closest("select[data-fan]"); if (!s) return;
+  s.blur();
   act({action: "set_fan_mode", entity_id: s.dataset.fan, fan_mode: s.value}, "Вентилятор");
 });
 
