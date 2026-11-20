@@ -27,13 +27,17 @@ ACTIONS_PER_MINUTE = 30
 # After an action the app shows the requested value as "pending" for up to
 # PENDING_TTL seconds and asks HA to refresh the entity at REFRESH_DELAYS.
 PENDING_TTL = 240
-REFRESH_DELAYS = (15, 60, 150)
+REFRESH_DELAYS = (20, 90)
+# Refresh ticks closer than this are merged into one update_entity call.
+REFRESH_MERGE_SECONDS = 15
 # After away mode ends, the zones and hot water are re-read from the cloud and
 # shown as "syncing" (locked) for up to SYNC_SECONDS.
 SYNC_SECONDS = 30
 # "Refresh all" asks every integration to poll; cloud APIs have quotas.
-REFRESH_COOLDOWN = 20
+REFRESH_COOLDOWN = 60
 HOLIDAY_MAX_DAYS = 30
+# "Until cancelled" away mode: same length as the myVAILLANT away switch uses.
+HOLIDAY_DEFAULT_DAYS = 365
 
 # ---------------------------------------------------------------------------
 # Layout: what the Mini App shows. It is stored as JSON in the integration

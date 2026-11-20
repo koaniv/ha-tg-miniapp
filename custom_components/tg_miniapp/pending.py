@@ -18,7 +18,7 @@ import time
 from homeassistant.core import HassJob, HomeAssistant, callback
 from homeassistant.helpers.event import async_call_later
 
-from .const import DOMAIN, PENDING_TTL, REFRESH_DELAYS, SYNC_SECONDS
+from .const import DOMAIN, PENDING_TTL, REFRESH_DELAYS, REFRESH_MERGE_SECONDS, SYNC_SECONDS
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -50,6 +50,10 @@ class PendingStore:
     def __init__(self, hass: HomeAssistant) -> None:
         self.hass = hass
         self._items: dict[str, dict] = {}
+        # Shared refresh ticks: [(monotonic fire time, cancel)]. Each tick polls
+        # every still-pending entity in one update_entity call, so a cloud
+        # integration is asked once per tick, not once per entity.
+        self._ticks: list[tuple[float, object]] = []
 
     def matches(self, entity_id: str, state: str, attrs: dict) -> bool:
         item = self._items[entity_id]
@@ -62,20 +66,28 @@ class PendingStore:
         self.drop(entity_id)
         if state is None and not attrs:
             return
-        self._items[entity_id] = {"s": state, "a": attrs, "until": time.monotonic() + PENDING_TTL,
-                                  "cancel": []}
+        self._items[entity_id] = {"s": state, "a": attrs, "until": time.monotonic() + PENDING_TTL}
         st = self.hass.states.get(entity_id)
         if st is not None and self.matches(entity_id, st.state, dict(st.attributes)):
             self.drop(entity_id)
             return
-        @callback
-        def _fire(_now, eid: str = entity_id) -> None:
-            self._refresh(eid)
+        now = time.monotonic()
+        for delay in REFRESH_DELAYS:
+            fire = now + delay
+            if not any(abs(t - fire) < REFRESH_MERGE_SECONDS for t, _ in self._ticks):
+                self._schedule_tick(fire, delay)
 
-        job = HassJob(_fire, cancel_on_shutdown=True)
-        self._items[entity_id]["cancel"] = [
-            async_call_later(self.hass, delay, job) for delay in REFRESH_DELAYS
-        ]
+    def _schedule_tick(self, fire: float, delay: float) -> None:
+        holder: list = []
+
+        @callback
+        def _tick(_now) -> None:
+            self._ticks[:] = [t for t in self._ticks if t is not holder[0]]
+            self._refresh_pending()
+
+        entry = (fire, async_call_later(self.hass, delay, HassJob(_tick, cancel_on_shutdown=True)))
+        holder.append(entry)
+        self._ticks.append(entry)
 
     def overlay(self, entity_id: str, out: dict) -> dict:
         """Apply a pending result to a state dict ({"s", "a", ...}) and mark it."""
@@ -92,35 +104,38 @@ class PendingStore:
         return out
 
     def drop(self, entity_id: str) -> None:
-        item = self._items.pop(entity_id, None)
-        for cancel in (item or {}).get("cancel", []):
-            cancel()
+        self._items.pop(entity_id, None)
 
     def clear(self) -> None:
-        for entity_id in list(self._items):
-            self.drop(entity_id)
+        self._items.clear()
+        for _, cancel in self._ticks:
+            cancel()
+        self._ticks.clear()
 
     def __contains__(self, entity_id: str) -> bool:
         return entity_id in self._items
 
-    def _refresh(self, entity_id: str) -> None:
-        st = self.hass.states.get(entity_id)
-        if entity_id not in self._items:
-            return
-        if st is not None and self.matches(entity_id, st.state, dict(st.attributes)):
-            self.drop(entity_id)
-            return
-        if not self.hass.services.has_service("homeassistant", "update_entity"):
-            return
-        self.hass.async_create_task(self._async_update(entity_id), eager_start=True)
+    def expected_state(self, entity_id: str) -> str | None:
+        """Requested state of an entity that HA has not confirmed yet."""
+        item = self._items.get(entity_id)
+        if item is None or time.monotonic() > item["until"]:
+            return None
+        return item["s"]
 
-    async def _async_update(self, entity_id: str) -> None:
-        try:
-            await self.hass.services.async_call(
-                "homeassistant", "update_entity", {"entity_id": entity_id}, blocking=True
-            )
-        except Exception as err:  # noqa: BLE001 - a failed refresh is not fatal
-            _LOGGER.debug("Mini App: refresh of %s failed: %s", entity_id, err)
+    def _refresh_pending(self) -> None:
+        """Poll the entities that are still pending, in one call."""
+        now = time.monotonic()
+        ids = []
+        for entity_id, item in list(self._items.items()):
+            st = self.hass.states.get(entity_id)
+            if now > item["until"] or (
+                st is not None and self.matches(entity_id, st.state, dict(st.attributes))
+            ):
+                self.drop(entity_id)
+            else:
+                ids.append(entity_id)
+        if ids:
+            self.hass.async_create_task(async_update_entities(self.hass, ids), eager_start=True)
 
 
 
@@ -147,14 +162,19 @@ def start_sync(hass: HomeAssistant, entity_ids) -> None:
     data = hass.data[DOMAIN]
     data["sync_until"] = time.monotonic() + SYNC_SECONDS
     ids = list(entity_ids)
-    hass.async_create_task(async_update_entities(hass, ids), eager_start=True)
+    # The away switch has just been read from the cloud, so the zones were too.
+    # One more poll a little later picks up what the cloud changes after a
+    # holiday ends. A previous sync's poll is replaced, not added to.
+    if (old := data.pop("sync_unsub", None)) is not None:
+        old()
 
     @callback
     def _again(_now) -> None:
+        data.pop("sync_unsub", None)
         hass.async_create_task(async_update_entities(hass, ids), eager_start=True)
 
-    data.setdefault("unsubs", []).append(
-        async_call_later(hass, SYNC_SECONDS // 2, HassJob(_again, cancel_on_shutdown=True))
+    data["sync_unsub"] = async_call_later(
+        hass, SYNC_SECONDS // 2, HassJob(_again, cancel_on_shutdown=True)
     )
 
 

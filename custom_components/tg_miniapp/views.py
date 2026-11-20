@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
 import logging
 import math
 from pathlib import Path
@@ -14,7 +15,7 @@ from aiohttp import web
 
 from homeassistant.components.http import HomeAssistantView
 from homeassistant.const import CONF_API_KEY
-from homeassistant.core import HomeAssistant
+from homeassistant.core import Context, HomeAssistant
 from homeassistant.exceptions import HomeAssistantError
 
 from .auth import InitDataError, validate_init_data
@@ -26,6 +27,7 @@ from .const import (
     DOMAIN,
     EXPOSED_ATTRS,
     INIT_DATA_HEADER,
+    HOLIDAY_DEFAULT_DAYS,
     HOLIDAY_MAX_DAYS,
     INIT_DATA_MAX_AGE,
     PAGE_URL,
@@ -266,13 +268,17 @@ class ActionView(HomeAssistantView):
         except ValueError as err:
             return self.json_message(str(err), 400, headers=API_HEADERS)
 
+        who = str(user.get("first_name") or user["id"])
         for domain, service, data in plan.calls:
             _LOGGER.info(
-                "Mini App: %s (%s) -> %s.%s %s",
-                user.get("first_name"), user["id"], domain, service, data,
+                "Mini App: %s (%s) -> %s.%s %s", who, user["id"], domain, service, data,
             )
+            # One context per call, also used for a logbook entry, so HA's
+            # logbook shows which Telegram user made the change.
+            context = Context()
+            _logbook(hass, who, domain, service, data, context)
             try:
-                await hass.services.async_call(domain, service, data, blocking=True, context=None)
+                await hass.services.async_call(domain, service, data, blocking=True, context=context)
             except (HomeAssistantError, ValueError) as err:
                 # Details go to the log, not to the client.
                 _LOGGER.warning("Mini App: %s.%s failed: %s", domain, service, err)
@@ -297,6 +303,22 @@ class ActionView(HomeAssistantView):
         return self.json({"ok": True}, headers=API_HEADERS)
 
 
+def _logbook(hass: HomeAssistant, who: str, domain: str, service: str, data: dict,
+             context: Context) -> None:
+    if not hass.services.has_service("logbook", "log"):
+        return
+    details = ", ".join(f"{k}={v}" for k, v in data.items() if k != "entity_id")
+    entry = {
+        "name": "Telegram Mini App",
+        "message": f"{who}: {domain}.{service}" + (f" ({details})" if details else ""),
+        "entity_id": data["entity_id"],
+    }
+    hass.async_create_task(
+        hass.services.async_call("logbook", "log", entry, blocking=False, context=context),
+        eager_start=True,
+    )
+
+
 class Locked(ValueError):
     """The action is not allowed in the current mode (e.g. away mode is on)."""
 
@@ -318,15 +340,16 @@ class Plan:
         return self
 
 
-def _away_on(hass: HomeAssistant, layout: dict) -> bool:
-    sw = away_switch(layout)
-    st = hass.states.get(sw) if sw else None
-    return st is not None and st.state == "on"
-
-
 def _check_unlocked(hass: HomeAssistant, layout: dict) -> None:
-    if _away_on(hass, layout):
-        raise Locked("away_mode", "away mode is on")
+    """Zones and hot water cannot be changed in away mode or while it is changing."""
+    sw = away_switch(layout)
+    if sw:
+        st = hass.states.get(sw)
+        requested = _pending(hass).expected_state(sw)
+        if requested == "on" or (st is not None and st.state == "on" and requested != "off"):
+            raise Locked("away_mode", "away mode is on")
+        if requested == "off":
+            raise Locked("syncing", "away mode is being turned off")
     if sync_remaining(hass):
         raise Locked("syncing", "heating state is being refreshed")
 
@@ -359,15 +382,17 @@ def _build_plan(hass: HomeAssistant, body: dict) -> Plan:
         if not sw or hass.states.get(sw) is None:
             raise ValueError("no away switch")
         days = body.get("days")
-        if days is None:  # until cancelled
-            return Plan().add(sw.split(".", 1)[0], "turn_on", {"entity_id": sw})
-        if isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= HOLIDAY_MAX_DAYS:
+        if days is not None and (
+            isinstance(days, bool) or not isinstance(days, int) or not 1 <= days <= HOLIDAY_MAX_DAYS
+        ):
             raise ValueError("bad days")
         target = next(iter(sorted(zone_entities(layout))), None)
         if target is None or not hass.services.has_service("mypyllant", "set_holiday"):
+            if days is None:  # plain switch: no holiday service to call
+                return Plan().add(sw.split(".", 1)[0], "turn_on", {"entity_id": sw})
             raise ValueError("holiday duration not supported")
         plan = Plan()
-        plan.calls.append(("mypyllant", "set_holiday", {"entity_id": target, "duration_hours": days * 24}))
+        plan.calls.append(("mypyllant", "set_holiday", {"entity_id": target, **_holiday_window(days)}))
         plan.expect.append((sw, "on", {}))
         return plan
 
@@ -426,6 +451,19 @@ def _build_plan(hass: HomeAssistant, body: dict) -> Plan:
         return Plan().add("climate", "set_fan_mode", {"entity_id": entity_id, "fan_mode": mode})
 
     raise ValueError("unknown action")
+
+
+def _holiday_window(days: int | None) -> dict[str, str]:
+    """Start/end for mypyllant.set_holiday, written in UTC.
+
+    myPyllant sends the wall-clock time of the datetime it is given with a "Z"
+    appended and no conversion. Its own default start is "now" in the home
+    time zone, so in Kyiv (UTC+2) a holiday started 2 hours late. Passing the
+    times in UTC makes the wall clock and the "Z" agree.
+    """
+    start = datetime.now(UTC).replace(second=0, microsecond=0)
+    end = start + timedelta(days=days or HOLIDAY_DEFAULT_DAYS)
+    return {"start": start.isoformat(), "end": end.isoformat()}
 
 
 def _clamp_temperature(st, value, default_step: float) -> float:

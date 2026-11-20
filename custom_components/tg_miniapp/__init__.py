@@ -83,7 +83,7 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     pending = data.get("pending")
     if pending is not None:
         pending.clear()
-    for unsub in data.pop("unsubs", []):
+    if (unsub := data.pop("sync_unsub", None)) is not None:
         unsub()
     data.pop("sync_until", None)
     return True
