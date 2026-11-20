@@ -135,21 +135,32 @@ async def test_away_locks_vaillant_but_not_ac_or_heat_pump(hass, client):
     assert len(sw) == 1
 
 
-async def test_away_on_until_cancelled_and_for_days(hass, client):
-    sw = async_mock_service(hass, "switch", "turn_on")
+async def test_away_on_sends_utc_start_and_end(hass, client):
+    """myPyllant formats wall-clock time + "Z": start/end must be given in UTC."""
+    from datetime import UTC, datetime, timedelta
+
     hol = async_mock_service(hass, "mypyllant", "set_holiday")
-    status, body = await client.post({"action": "away_on", "days": None})
-    assert status == 200 and len(sw) == 1 and body["states"][AWAY]["s"] == "on" and body["states"][AWAY]["p"] == 1
+    sw = async_mock_service(hass, "switch", "turn_on")
     status, body = await client.post({"action": "away_on", "days": 3})
-    assert status == 200
-    assert hol[-1].data["duration_hours"] == 72 and hol[-1].data["entity_id"] in (Z1, Z2)
-    assert body["states"][AWAY]["p"] == 1
+    assert status == 200 and not sw
+    data = hol[-1].data
+    assert data["entity_id"] in (Z1, Z2) and "duration_hours" not in data
+    start, end = datetime.fromisoformat(data["start"]), datetime.fromisoformat(data["end"])
+    assert start.utcoffset() == timedelta(0) and end - start == timedelta(days=3)
+    assert abs(datetime.now(UTC) - start) < timedelta(minutes=2)
+    assert body["states"][AWAY]["s"] == "on" and body["states"][AWAY]["p"] == 1
+    # "until cancelled" also goes through set_holiday (the switch would start 2 h late)
+    status, _ = await client.post({"action": "away_on", "days": None})
+    data = hol[-1].data
+    assert status == 200 and not sw
+    assert datetime.fromisoformat(data["end"]) - datetime.fromisoformat(data["start"]) == timedelta(days=365)
     for bad in (0, 31, "3", True, 1.5):
         assert (await client.post({"action": "away_on", "days": bad}))[0] == 400
 
 
-async def test_away_days_need_mypyllant(hass, client):
-    async_mock_service(hass, "switch", "turn_on")
+async def test_away_without_mypyllant_uses_switch(hass, client):
+    sw = async_mock_service(hass, "switch", "turn_on")
+    assert (await client.post({"action": "away_on", "days": None}))[0] == 200 and len(sw) == 1
     assert (await client.post({"action": "away_on", "days": 1}))[0] == 400
 
 
@@ -161,6 +172,14 @@ async def test_refresh_all_with_cooldown(hass, client):
     assert Z1 in ids and WH in ids and "sensor.soc" in ids
     status, body = await client.post({"action": "refresh"})
     assert status == 200 and body["skipped"] is True and len(upd) == 1
+    import custom_components.tg_miniapp.views as views
+    real = views.time.monotonic
+    views.time.monotonic = lambda: real() + 61
+    try:
+        status, body = await client.post({"action": "refresh"})
+    finally:
+        views.time.monotonic = real
+    assert status == 200 and "skipped" not in body and len(upd) == 2
 
 
 async def test_away_off_syncs_and_locks_briefly(hass, client):
@@ -169,15 +188,15 @@ async def test_away_off_syncs_and_locks_briefly(hass, client):
     await hass.async_block_till_done()
     hass.states.async_set(AWAY, "off", {})  # e.g. turned off by the grid automation
     await hass.async_block_till_done()
-    assert upd and set(upd[-1].data["entity_id"]) == {Z1, Z2, WH}
+    assert not upd  # the switch was just polled, so the zones were too
     body = await client.state()
     assert body["sync"] > 0
     status, resp = await client.post({"action": "set_hvac_mode", "entity_id": Z1, "hvac_mode": "off"})
     assert status == 409 and resp["code"] == "syncing"
-    # second refresh half-way, then the lock is gone
+    # one refresh half-way, then the lock is gone
     async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=16))
     await hass.async_block_till_done()
-    assert len(upd) == 2
+    assert len(upd) == 1 and set(upd[0].data["entity_id"]) == {Z1, Z2, WH}
     import custom_components.tg_miniapp.pending as pending
     real = pending.time.monotonic
     pending.time.monotonic = lambda: real() + 60
@@ -192,3 +211,29 @@ def test_example_layout_has_heat_pump_temperatures():
     hp = EXAMPLE_LAYOUT["heating"]["heatpump"]
     assert hp["temp_heating"].startswith("sensor.") and hp["temp_dhw"].startswith("sensor.")
     assert zone_entities(parse_layout(LAYOUT)) == {Z1, Z2}
+
+
+async def test_pending_away_locks_on_server(hass, client):
+    """Away mode requested but not confirmed yet: zones are locked already."""
+    hol = async_mock_service(hass, "mypyllant", "set_holiday")
+    async_mock_service(hass, "climate", "set_hvac_mode")
+    await client.post({"action": "away_on", "days": 1})
+    assert hol
+    status, resp = await client.post({"action": "set_hvac_mode", "entity_id": Z1, "hvac_mode": "off"})
+    assert status == 409 and resp["code"] == "away_mode"
+    # and while away mode is being turned off
+    hass.states.async_set(AWAY, "on", {})
+    async_mock_service(hass, "switch", "turn_off")
+    await client.post({"action": "switch_off", "entity_id": AWAY})
+    status, resp = await client.post({"action": "set_hvac_mode", "entity_id": Z1, "hvac_mode": "off"})
+    assert status == 409 and resp["code"] == "syncing"
+
+
+async def test_action_logged_with_user_and_context(hass, client):
+    logs = async_mock_service(hass, "logbook", "log")
+    calls = async_mock_service(hass, "switch", "turn_on")
+    await client.post({"action": "switch_on", "entity_id": "switch.hp"})
+    await hass.async_block_till_done()
+    assert logs and logs[0].data["entity_id"] == "switch.hp"
+    assert logs[0].data["message"].startswith("A: switch.turn_on")
+    assert logs[0].context.id == calls[0].context.id

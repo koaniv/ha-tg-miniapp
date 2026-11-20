@@ -116,9 +116,9 @@ async def test_pending_refreshes_entity_then_expires(hass, client, monkeypatch):
     refresh = async_mock_service(hass, "homeassistant", "update_entity")
     async_mock_service(hass, "water_heater", "set_operation_mode")
     await client.post({"action": "set_operation_mode", "entity_id": WH, "operation_mode": "Manual"})
-    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=16))
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=21))
     await hass.async_block_till_done()
-    assert [c.data["entity_id"] for c in refresh] == [WH]
+    assert [c.data["entity_id"] for c in refresh] == [[WH]]
     st = (await client.state())["states"][WH]
     assert st["s"] == "Manual" and st["a"]["operation_mode"] == "Manual" and st["p"] == 1
     # never confirmed: after the TTL the real state is shown again
@@ -156,3 +156,27 @@ def test_layout_validation():
                 {"heating": {"dhw": "water_heater.x"}}):
         with pytest.raises(LayoutError):
             parse_layout(bad)
+
+
+async def test_pending_entities_refreshed_together(hass, client):
+    """Several pending entities: one update_entity call per tick, two ticks in total."""
+    refresh = async_mock_service(hass, "homeassistant", "update_entity")
+    async_mock_service(hass, "water_heater", "set_operation_mode")
+    async_mock_service(hass, "climate", "set_hvac_mode")
+    await client.post({"action": "set_operation_mode", "entity_id": WH, "operation_mode": "Manual"})
+    await client.post({"action": "set_hvac_mode", "entity_id": ZONE, "hvac_mode": "heat_cool"})
+    for secs in (21, 91, 300):
+        async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=secs))
+        await hass.async_block_till_done()
+    assert len(refresh) == 2
+    assert all(sorted(c.data["entity_id"]) == sorted([WH, ZONE]) for c in refresh)
+
+
+async def test_confirmed_entity_not_refreshed(hass, client):
+    refresh = async_mock_service(hass, "homeassistant", "update_entity")
+    async_mock_service(hass, "climate", "set_hvac_mode")
+    await client.post({"action": "set_hvac_mode", "entity_id": ZONE, "hvac_mode": "heat_cool"})
+    hass.states.async_set(ZONE, "heat_cool", {"hvac_modes": ["off", "heat_cool", "auto"], "temperature": 21})
+    async_fire_time_changed(hass, dt_util.utcnow() + timedelta(seconds=21))
+    await hass.async_block_till_done()
+    assert not refresh

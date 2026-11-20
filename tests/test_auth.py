@@ -1,4 +1,4 @@
-import hashlib, hmac, json, sys, time
+import hashlib, hmac, json, time
 from pathlib import Path
 from urllib.parse import urlencode
 
